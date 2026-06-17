@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+config/runtime.json
+data/
+logs/
+trades/
+*.log
+.DS_Store
+*.bak
+coverage/
+.cache/

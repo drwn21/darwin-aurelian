@@ -1,0 +1,29 @@
+#!/bin/bash
+# Usage: ./cfg                    — show all config
+#        ./cfg tradeAmountSol     — show one value
+#        ./cfg tradeAmountSol 0.02 — set value
+
+FILE="$HOME/aurelian/config/runtime.json"
+
+if [ ! -f "$FILE" ]; then
+  echo "runtime.json not found"
+  exit 1
+fi
+
+if [ $# -eq 0 ]; then
+  cat "$FILE" | jq -S '.'
+elif [ $# -eq 1 ]; then
+  jq -r ".[\"$1\"] // \"not found\"" "$FILE"
+elif [ $# -eq 2 ]; then
+  KEY="$1"
+  VAL="$2"
+  # auto-detect number vs string
+  if [[ "$VAL" =~ ^-?[0-9]+\.?[0-9]*$ ]]; then
+    jq --arg k "$KEY" --argjson v "$VAL" '.[$k] = $v' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+  else
+    jq --arg k "$KEY" --arg v "$VAL" '.[$k] = $v' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+  fi
+  echo "$KEY = $VAL"
+else
+  echo "Usage: ./cfg [key] [value]"
+fi
