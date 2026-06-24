@@ -26,6 +26,22 @@ export interface RuntimeConfig {
     maxConcurrentPositions: number;
   };
 
+  /** Adaptive / context-aware position sizing controls. */
+  sizing: {
+    /** Scale buy size by recent win rate (last 20 sells) when enabled. */
+    adaptiveSizingEnabled: boolean;
+    /** Recent win rate at/below this scales size down. */
+    lowWinRateThreshold: number;
+    /** Recent win rate at/above this scales size up. */
+    highWinRateThreshold: number;
+    /** Multiplier applied when recent win rate is low. */
+    lowWinRateMultiplier: number;
+    /** Multiplier applied when recent win rate is high. */
+    highWinRateMultiplier: number;
+    /** Reduce buy size by 50% during low-volume UTC hours (00:00–08:00). */
+    timeAwarenessEnabled: boolean;
+  };
+
   risk: {
     dailyLossLimitSol: number;
     maxConsecutiveLosses: number;
@@ -48,6 +64,13 @@ export interface RuntimeConfig {
     trailingStopPct: number;
     /** Enable trailing stop after partial sell. */
     useTrailingStop: boolean;
+    /** Enable tiered trailing: tighten trail % as profit grows. */
+    tieredTrailingEnabled: boolean;
+    /** Tiered trailing thresholds — trail % at each profit tier. */
+    tieredTrailAt100Pct: number;  // trail % when profit >= 100%
+    tieredTrailAt200Pct: number;  // trail % when profit >= 200%
+    tieredTrailAt500Pct: number;  // trail % when profit >= 500%
+    tieredTrailAt1000Pct: number; // trail % when profit >= 1000%
     /** Soft stop-loss as a % loss (e.g. -20) — after grace + confirms. */
     stopLossPct: number;
     /** Hard stop-loss (e.g. -30) — immediate, no grace. */
@@ -62,6 +85,9 @@ export interface RuntimeConfig {
     canSellBackMinAgeMs: number;
     /** Max number of sell retries before marking a position as stuck. */
     maxSellRetries: number;
+    /** Max consecutive transient sell failures before alerting the operator.
+     *  Unlike maxSellRetries this never force-closes — it only sends an alert. */
+    maxTransientSellRetries: number;
     /** Consecutive price-feed misses before force-closing a position. */
     priceFailCloseThreshold: number;
   };
@@ -74,11 +100,27 @@ export interface RuntimeConfig {
     /** Maximum token age to snipe, in ms. */
     maxAgeMs: number;
     minCompositeScore: number;
+    minVolume24hUsd?: number;
+    maxBundlerRate?: number;
+    maxEntrapmentRatio?: number;
+    minPriceChange5mPct?: number;
+    maxPriceChange5mPct?: number;
+    maxPriceChange1hPct?: number;
+    minPriceChange1hPct?: number;
+    minPriceChange1mPct?: number;
+    maxPriceChange1mPct?: number;
+    minSmartDegenCount?: number;
     originality?: {
       minScore: number;
       minMargin: number;
       cohortWindowMs: number;
       singletonDelayMs: number;
+      singleton?: {
+        maxTop10Pct: number;
+        minHolders: number;
+        maxEntrapmentPct: number;
+        maxFails: number;
+      };
     };
   };
 
@@ -99,6 +141,26 @@ export interface RuntimeConfig {
     rugSignalCheckEnabled: boolean;
     /** Minimum gap between safety checks per position, in ms. */
     bundlerCheckIntervalMs: number;
+    /** Bundler detector rule thresholds — tunable at runtime. */
+    bundler: {
+      /** Rule 1: transfers in active window (30s). */
+      rule1MinTransfers: number;
+      /** Rule 1: max unique payers for Rule 1 to fire. */
+      rule1MaxPayers: number;
+      /** Rule 2: minimum burst count (consecutive tx within 5s). */
+      rule2MinBurstCount: number;
+      /** Rule 2: max unique payers for Rule 2 to fire. */
+      rule2MaxPayers: number;
+      /** Rule 3: extreme burst — triggers regardless of payer count. */
+      rule3MinBurstCount: number;
+      /** When true (default), runtime bundler detections only force-close on
+       *  DUMP (price declining). Accumulation (price stable/rising) is held. */
+      runtimeDumpOnly: boolean;
+      /** Minimum price drop (%) from last bundler-check price to qualify as a
+       *  dump. E.g. 5 means currentPrice must be ≥5% below the price recorded
+       *  at the previous bundler check (~30s ago) to trigger a force-close. */
+      dumpPriceDropPct: number;
+    };
   };
 }
 
@@ -112,6 +174,14 @@ function buildDefaults(): RuntimeConfig {
     main: {
       tradeAmountSol: STRATEGY.tradeAmountSol,
       maxConcurrentPositions: STRATEGY.maxConcurrentPositions,
+    },
+    sizing: {
+      adaptiveSizingEnabled: true,
+      lowWinRateThreshold: 0.40,
+      highWinRateThreshold: 0.60,
+      lowWinRateMultiplier: 0.5,
+      highWinRateMultiplier: 1.25,
+      timeAwarenessEnabled: true,
     },
     risk: {
       dailyLossLimitSol: STRATEGY.dailyLossLimitSol,
@@ -128,12 +198,18 @@ function buildDefaults(): RuntimeConfig {
       firstTargetSellPct: STRATEGY.firstTargetSellPct,
       trailingStopPct: STRATEGY.trailingStopPct,
       useTrailingStop: STRATEGY.useTrailingStop,
+      tieredTrailingEnabled: true,
+      tieredTrailAt100Pct: 16,
+      tieredTrailAt200Pct: 13,
+      tieredTrailAt500Pct: 10,
+      tieredTrailAt1000Pct: 8,
       stopLossPct: STRATEGY.stopLossPct,
       hardStopLossPct: STRATEGY.hardStopLossPct,
       slGracePeriodMs: STRATEGY.slGracePeriodMs,
       slConfirms: STRATEGY.slConfirms,
       canSellBackMinAgeMs: 120 * 60 * 1000,
       maxSellRetries: 10,
+      maxTransientSellRetries: 20,
       // 10 misses × 5s ≈ 50s of dark feed + 120s grace ≈ 2.5 min before fail-closed.
       // Fast enough to catch LP removal, slow enough for unindexed Pump.fun tokens.
       priceFailCloseThreshold: 10,
@@ -145,11 +221,20 @@ function buildDefaults(): RuntimeConfig {
       minHolderCount: SCREENING.minHolderCount,
       maxAgeMs: SCREENING.maxAgeMs,
       minCompositeScore: SCREENING.minCompositeScore,
+      minPriceChange1mPct: -3,
+      maxPriceChange1mPct: 100,
+      minSmartDegenCount: 1,
       originality: {
         minScore: 60,
         minMargin: 12,
         cohortWindowMs: 180_000,
         singletonDelayMs: 45_000,
+        singleton: {
+          maxTop10Pct: 65,
+          minHolders: 50,
+          maxEntrapmentPct: 40,
+          maxFails: 1,
+        },
       },
     },
     gmgn: {
@@ -162,6 +247,15 @@ function buildDefaults(): RuntimeConfig {
       bundlerCheckEnabled: true,
       rugSignalCheckEnabled: true,
       bundlerCheckIntervalMs: 30_000,
+      bundler: {
+        rule1MinTransfers: 30,
+        rule1MaxPayers: 2,
+        rule2MinBurstCount: 20,
+        rule2MaxPayers: 2,
+        rule3MinBurstCount: 40,
+        runtimeDumpOnly: true,
+        dumpPriceDropPct: 10,
+      },
     },
   };
 }
@@ -253,11 +347,16 @@ class ConfigManager extends EventEmitter {
       mode: raw.mode === 'production' || raw.mode === 'test' ? raw.mode : defaults.mode,
       dryRun: typeof raw.dryRun === 'boolean' ? raw.dryRun : defaults.dryRun,
       main: { ...defaults.main, ...(raw.main ?? {}) },
+      sizing: { ...defaults.sizing, ...(raw.sizing ?? {}) },
       risk: { ...defaults.risk, ...(raw.risk ?? {}) },
       strategy: { ...defaults.strategy, ...(raw.strategy ?? {}) },
       screening: { ...defaults.screening, ...(raw.screening ?? {}) },
       gmgn: { ...defaults.gmgn, ...(raw.gmgn ?? {}) },
-      safety: { ...defaults.safety, ...(raw.safety ?? {}) },
+      safety: {
+        ...defaults.safety,
+        ...(raw.safety ?? {}),
+        bundler: { ...defaults.safety.bundler, ...(raw.safety?.bundler ?? {}) },
+      },
     };
   }
 

@@ -3,9 +3,15 @@ import { configManager } from '../config/ConfigManager.js';
 import { SwapResult } from '../types/index.js';
 import { JupiterClient } from './JupiterClient.js';
 import { getWallet, getTokenBalance, deserializeVersionedTransaction, sendAndConfirmVersionedTx } from '../utils/solana.js';
-import { isKnownBundlerToken, checkBundlerPattern } from '../screening/BundlerDetector.js';
 import { logger } from '../logger/Logger.js';
 import { tradeLog } from '../logger/Logger.js';
+import {
+  getAssociatedTokenAddress,
+  getAccount,
+  createCloseAccountInstruction,
+} from '@solana/spl-token';
+import { PublicKey, Transaction } from '@solana/web3.js';
+import { getConnection } from '../utils/solana.js';
 
 export class ExecutionEngine {
   private jupiter: JupiterClient;
@@ -23,21 +29,8 @@ export class ExecutionEngine {
     const { buySlippageBps, priorityFeeLamports } = configManager.get().strategy;
     const amountLamports = BigInt(Math.floor(amountSol * LAMPORTS_PER_SOL));
 
-    // Pre-buy bundler gate: refuse to enter a token that history already flagged
-    // as a bundler, or that shows an active transfer-burst right now. Gated by
-    // the same safety toggle as the runtime monitor, and no-ops without a
-    // Helius key (checkBundlerPattern returns a neutral result).
-    if (configManager.get().safety?.bundlerCheckEnabled !== false) {
-      if (isKnownBundlerToken(tokenMint)) {
-        logger.warn('Buy skipped — known bundler token', { token: tokenMint });
-        return { success: false, error: 'Bundler token (known)' };
-      }
-      const bundler = await checkBundlerPattern(tokenMint);
-      if (bundler.isBundler) {
-        logger.warn('Buy skipped — active bundler pattern', { token: tokenMint, details: bundler.details });
-        return { success: false, error: 'Bundler pattern detected' };
-      }
-    }
+    // NOTE: Pre-buy bundler gate removed — bundler buying at launch = good
+    // momentum signal. Runtime bundler monitoring (dump-only) handles exits.
 
     logger.info('Executing buy', { token: tokenMint, sol: amountSol });
 
@@ -111,7 +104,7 @@ export class ExecutionEngine {
     const wallet = getWallet();
 
     const amount = tokenAmountRaw ?? (await getTokenBalance(tokenMint));
-    if (amount === 0) return { success: false, error: 'Zero token balance' };
+    if (amount === 0) return { success: false, error: 'Zero token balance', failureType: 'permanent' };
 
     logger.info('Executing sell', { token: tokenMint, amount });
 
@@ -143,7 +136,12 @@ export class ExecutionEngine {
     }
     if (!quote) {
       logger.error('Sell quote failed after all retries', { token: tokenMint });
-      return { success: false, error: 'Failed to get Jupiter quote for sell (all retries exhausted)' };
+      // No route after retries = unsellable token (honeypot / dead LP) — permanent.
+      return {
+        success: false,
+        error: 'Failed to get Jupiter quote for sell (all retries exhausted)',
+        failureType: 'permanent',
+      };
     }
 
     const txBuf = await this.jupiter.buildSwapTransaction(
@@ -151,7 +149,8 @@ export class ExecutionEngine {
       wallet.publicKey.toBase58(),
       configManager.get().strategy.priorityFeeLamports,
     );
-    if (!txBuf) return { success: false, error: 'Failed to build sell transaction' };
+    // Quote succeeded but build failed — treat as a transient API/network blip.
+    if (!txBuf) return { success: false, error: 'Failed to build sell transaction', failureType: 'transient' };
 
     try {
       const tx = deserializeVersionedTransaction(txBuf);
@@ -165,10 +164,123 @@ export class ExecutionEngine {
         txSig,
       });
 
-      return { success: true, txSig, solSpent: -solReceived, tokensReceived: 0 };
+      // Attempt to reclaim SOL rent from the empty token account after a full sell
+      let reclaimedSol = 0;
+      try {
+        reclaimedSol = await this.reclaimTokenAccount(tokenMint);
+      } catch (reclaimErr) {
+        logger.warn('Token account reclaim failed (non-blocking)', {
+          token: tokenMint,
+          err: String(reclaimErr),
+        });
+      }
+
+      return { success: true, txSig, solSpent: -solReceived, tokensReceived: 0, reclaimedSol };
     } catch (err) {
       logger.error('Sell transaction failed', { token: tokenMint, err: String(err) });
-      return { success: false, error: String(err) };
+      return { success: false, error: String(err), failureType: classifySwapFailure(String(err)) };
     }
   }
+
+  /**
+   * Close the empty SPL token account for `tokenMint` to reclaim ~0.002 SOL rent.
+   * Returns the reclaimed SOL amount, or 0 if nothing to reclaim.
+   * Wrapped in try/catch — never fails the sell if reclaim fails.
+   */
+  async reclaimTokenAccount(tokenMint: string): Promise<number> {
+    const wallet = getWallet();
+    const conn = getConnection();
+
+    const ata = await getAssociatedTokenAddress(
+      new PublicKey(tokenMint),
+      wallet.publicKey,
+    );
+
+    // Check if the token account exists and has 0 balance
+    let accountInfo;
+    try {
+      accountInfo = await getAccount(conn, ata);
+    } catch {
+      // Account doesn't exist — nothing to reclaim
+      logger.debug('Token account not found for reclaim', { token: tokenMint });
+      return 0;
+    }
+
+    if (accountInfo.amount > 0n) {
+      logger.debug('Token account still has balance, skipping reclaim', {
+        token: tokenMint,
+        balance: accountInfo.amount.toString(),
+      });
+      return 0;
+    }
+
+    // Build and send the close-account transaction
+    const closeIx = createCloseAccountInstruction(
+      ata,
+      wallet.publicKey, // destination for reclaimed rent
+      wallet.publicKey, // authority
+    );
+
+    const { blockhash } = await conn.getLatestBlockhash('confirmed');
+    const tx = new Transaction({
+      feePayer: wallet.publicKey,
+      recentBlockhash: blockhash,
+    });
+    tx.add(closeIx);
+
+    tx.sign(wallet);
+    const txSig = await conn.sendRawTransaction(tx.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+
+    // Wait for confirmation
+    const { value: status } = await conn.getSignatureStatus(txSig);
+    const confirmed = status && !status.err &&
+      (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized');
+
+    if (!confirmed) {
+      // Poll briefly for confirmation
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1_500));
+        const poll = await conn.getSignatureStatus(txSig);
+        if (poll.value && !poll.value.err &&
+            (poll.value.confirmationStatus === 'confirmed' || poll.value.confirmationStatus === 'finalized')) {
+          break;
+        }
+      }
+    }
+
+    const reclaimedSol = 0.002; // ~rent-exempt minimum for token accounts
+    logger.info('Token account closed, reclaimed ~0.002 SOL rent', {
+      token: tokenMint,
+      txSig,
+      reclaimedSol,
+    });
+
+    return reclaimedSol;
+  }
+}
+
+/**
+ * Classify a send/confirm exception so the caller can distinguish a real
+ * honeypot (no route / failed simulation → 'permanent') from a transient
+ * outage (rate-limited / timeout / network → 'transient'). Defaults to
+ * 'transient' so a flaky RPC never gets mistaken for an unsellable token.
+ */
+function classifySwapFailure(err: string): 'permanent' | 'transient' {
+  const e = err.toLowerCase();
+  // Permanent: the swap can't physically execute (no route / simulation reverts).
+  if (
+    e.includes('no route') ||
+    e.includes('no_route') ||
+    e.includes('simulation failed') ||
+    e.includes('simulate') ||
+    e.includes('transactionsimulation')
+  ) {
+    return 'permanent';
+  }
+  // Transient: rate limits, timeouts, and network errors — retry later.
+  return 'transient';
 }

@@ -7,7 +7,7 @@
  * fit inside Telegram's 64-byte callback_data budget.
  */
 
-export type PanelId = 'main' | 'risk' | 'strategy' | 'screen' | 'gmgn' | 'safety';
+export type PanelId = 'main' | 'risk' | 'strategy' | 'trailing' | 'screen' | 'gmgn' | 'safety';
 
 export interface PanelMeta {
   id: PanelId;
@@ -18,6 +18,7 @@ export const PANELS: PanelMeta[] = [
   { id: 'main', title: 'Main' },
   { id: 'risk', title: 'Risk' },
   { id: 'strategy', title: 'Strategy' },
+  { id: 'trailing', title: 'Trailing' },
   { id: 'screen', title: 'Screening' },
   { id: 'gmgn', title: 'GMGN' },
   { id: 'safety', title: 'Safety' },
@@ -156,6 +157,14 @@ export const FIELDS: Field[] = [
   { id: 's_msr', panel: 'strategy', path: 'strategy.maxSellRetries', label: 'Max sell retries', type: 'number', kind: 'int', scale: 1, steps: [1, 5], min: 1, max: 50 },
   { id: 's_pfct', panel: 'strategy', path: 'strategy.priceFailCloseThreshold', label: 'Price fail close threshold', type: 'number', kind: 'int', scale: 1, steps: [1, 4], min: 1, max: 50 },
 
+  // ── Trailing ─────────────────────────────────────────────────────────────
+  { id: 't_en', panel: 'trailing', path: 'strategy.tieredTrailingEnabled', label: 'Tiered trailing', type: 'boolean' },
+  { id: 't_base', panel: 'trailing', path: 'strategy.trailingStopPct', label: 'Base trail %', type: 'number', kind: 'pct', scale: 1, steps: [1, 5], min: 1, max: 50 },
+  { id: 't_100', panel: 'trailing', path: 'strategy.tieredTrailAt100Pct', label: 'Trail at 100%+', type: 'number', kind: 'pct', scale: 1, steps: [1, 2], min: 1, max: 50 },
+  { id: 't_200', panel: 'trailing', path: 'strategy.tieredTrailAt200Pct', label: 'Trail at 200%+', type: 'number', kind: 'pct', scale: 1, steps: [1, 2], min: 1, max: 50 },
+  { id: 't_500', panel: 'trailing', path: 'strategy.tieredTrailAt500Pct', label: 'Trail at 500%+', type: 'number', kind: 'pct', scale: 1, steps: [1, 2], min: 1, max: 50 },
+  { id: 't_1k', panel: 'trailing', path: 'strategy.tieredTrailAt1000Pct', label: 'Trail at 1000%+', type: 'number', kind: 'pct', scale: 1, steps: [1, 2], min: 1, max: 50 },
+
   // ── Screening ──────────────────────────────────────────────────────────────
   { id: 'c_mnmc', panel: 'screen', path: 'screening.minMarketCapUsd', label: 'Min mcap', type: 'number', kind: 'usd', scale: 1, steps: [5000, 10000], min: 0, max: 10_000_000 },
   { id: 'c_mxmc', panel: 'screen', path: 'screening.maxMarketCapUsd', label: 'Max mcap', type: 'number', kind: 'usd', scale: 1, steps: [50000, 100000], min: 1000, max: 100_000_000 },
@@ -164,6 +173,16 @@ export const FIELDS: Field[] = [
   { id: 'c_age', panel: 'screen', path: 'screening.maxAgeMs', label: 'Max age', type: 'number', kind: 'durmin', scale: MIN, steps: [15, 30, 60], min: 1, max: 10080 },
   { id: 'c_scr', panel: 'screen', path: 'screening.minCompositeScore', label: 'Min score', type: 'number', kind: 'int', scale: 1, steps: [5, 10], min: 0, max: 100 },
   { id: 'c_rsk', panel: 'screen', path: 'screening.maxRiskScore', label: 'Max risk score', type: 'number', kind: 'int', scale: 1, steps: [5, 10], min: 0, max: 100 },
+  { id: 'c_vol', panel: 'screen', path: 'screening.minVolume24hUsd', label: 'Min 24h volume', type: 'number', kind: 'usd', scale: 1, steps: [1000, 5000], min: 0, max: 10_000_000 },
+  { id: 'c_bndr', panel: 'screen', path: 'screening.maxBundlerRate', label: 'Max bundler %', type: 'number', kind: 'pct', scale: 0.01, steps: [5, 10], min: 0, max: 100 },
+  { id: 'c_entr', panel: 'screen', path: 'screening.maxEntrapmentRatio', label: 'Max entrapment %', type: 'number', kind: 'pct', scale: 0.01, steps: [5, 10], min: 0, max: 100 },
+  { id: 'c_5mn', panel: 'screen', path: 'screening.minPriceChange5mPct', label: 'Min 5m change %', type: 'number', kind: 'pct', scale: 1, steps: [5, 10], min: -100, max: 0 },
+  { id: 'c_5mx', panel: 'screen', path: 'screening.maxPriceChange5mPct', label: 'Max 5m change %', type: 'number', kind: 'pct', scale: 1, steps: [10, 25], min: 0, max: 500 },
+  { id: 'c_1h', panel: 'screen', path: 'screening.maxPriceChange1hPct', label: 'Max 1h change %', type: 'number', kind: 'pct', scale: 1, steps: [10, 25], min: 0, max: 500 },
+  { id: 'c_1mn', panel: 'screen', path: 'screening.minPriceChange1hPct', label: 'Min 1h change %', type: 'number', kind: 'pct', scale: 1, steps: [5, 10], min: -100, max: 0 },
+  { id: 'c_1mi', panel: 'screen', path: 'screening.minPriceChange1mPct', label: 'Min 1m change %', type: 'number', kind: 'pct', scale: 1, steps: [1, 5], min: -100, max: 0 },
+  { id: 'c_1ma', panel: 'screen', path: 'screening.maxPriceChange1mPct', label: 'Max 1m change %', type: 'number', kind: 'pct', scale: 1, steps: [10, 25], min: 0, max: 500 },
+  { id: 'c_sdg', panel: 'screen', path: 'screening.minSmartDegenCount', label: 'Min smart degens', type: 'number', kind: 'int', scale: 1, steps: [1, 2], min: 0, max: 20 },
 
   // ── GMGN ──────────────────────────────────────────────────────────────────
   { id: 'g_int', panel: 'gmgn', path: 'gmgn.interval', label: 'Interval', type: 'enum', options: ['1m', '5m', '15m', '1h'] },
@@ -175,6 +194,17 @@ export const FIELDS: Field[] = [
   { id: 'f_bnd', panel: 'safety', path: 'safety.bundlerCheckEnabled', label: 'Bundler check', type: 'boolean' },
   { id: 'f_rug', panel: 'safety', path: 'safety.rugSignalCheckEnabled', label: 'Rug-signal check', type: 'boolean' },
   { id: 'f_int', panel: 'safety', path: 'safety.bundlerCheckIntervalMs', label: 'Safety check interval', type: 'number', kind: 'durmin', scale: MIN, steps: [0.5, 1], min: 0.1, max: 30 },
+  // ── Bundler detector thresholds (runtime tunable) ──
+  { id: 'f_r1t', panel: 'safety', path: 'safety.bundler.rule1MinTransfers', label: 'R1 min transfers', type: 'number', kind: 'int', scale: 1, steps: [5, 10], min: 5, max: 100 },
+  { id: 'f_r1p', panel: 'safety', path: 'safety.bundler.rule1MaxPayers', label: 'R1 max payers', type: 'number', kind: 'int', scale: 1, steps: [1], min: 1, max: 10 },
+  { id: 'f_r2b', panel: 'safety', path: 'safety.bundler.rule2MinBurstCount', label: 'R2 min burst', type: 'number', kind: 'int', scale: 1, steps: [5, 10], min: 5, max: 100 },
+  { id: 'f_r2p', panel: 'safety', path: 'safety.bundler.rule2MaxPayers', label: 'R2 max payers', type: 'number', kind: 'int', scale: 1, steps: [1], min: 1, max: 10 },
+  { id: 'f_r3b', panel: 'safety', path: 'safety.bundler.rule3MinBurstCount', label: 'R3 extreme burst', type: 'number', kind: 'int', scale: 1, steps: [10, 25], min: 10, max: 200 },
+  { id: 'f_dmp', panel: 'safety', path: 'safety.bundler.dumpPriceDropPct', label: 'Dump price drop %', type: 'number', kind: 'int', scale: 1, steps: [1, 5], min: 1, max: 50 },
+
+  // ── Sizing ────────────────────────────────────────────────────────────────
+  { id: 'z_adp', panel: 'safety', path: 'sizing.adaptiveSizingEnabled', label: 'Adaptive sizing', type: 'boolean' },
+  { id: 'z_tod', panel: 'safety', path: 'sizing.timeAwarenessEnabled', label: 'Time-of-day', type: 'boolean' },
 ];
 
 const FIELDS_BY_ID = new Map<string, Field>(FIELDS.map((f) => [f.id, f]));

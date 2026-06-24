@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import { ENV } from '../config/config.js';
+import { configManager } from '../config/ConfigManager.js';
 import { logger } from '../logger/Logger.js';
 
 /**
@@ -95,7 +96,13 @@ const CACHE_TTL = 15_000; // 15 seconds
 // ─── History Management ─────────────────────────────────────────────────────
 function loadHistory(): BundlerHistory {
   try {
-    return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) as BundlerHistory;
+    const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) as BundlerHistory;
+    // Ensure required keys exist — empty or corrupt files may parse but lack them.
+    if (!raw.tokens) raw.tokens = {};
+    if (!raw.wallets) raw.wallets = {};
+    if (!raw.stats) raw.stats = {};
+    if (!raw.paginationAnalysis) raw.paginationAnalysis = {};
+    return raw;
   } catch {
     return { tokens: {}, wallets: {}, stats: {}, paginationAnalysis: {} };
   }
@@ -275,21 +282,32 @@ export async function checkBundlerPattern(
         if (!payerWallets.includes(payer)) payerWallets.push(payer);
       }
 
+      // Read live thresholds from runtime config.
+      const bd = configManager.get().safety.bundler;
+
       // Rule 1: many transfers from very few payers.
-      if (activeTransfers.length >= 20 && activePayers.size <= 2) {
+      if (activeTransfers.length >= bd.rule1MinTransfers && activePayers.size <= bd.rule1MaxPayers) {
         reasons.push(`${activeTransfers.length} transfers from ${activePayers.size} payers in ${activeWindow}s`);
         isBundler = true;
       }
 
       // Rule 2: burst within 5s — only if very few payers (real bundler is
-      // 1-2 wallets doing many transfers).
+      // 1-2 wallets doing many transfers). Loosened: 3 payers with 19 burst
+      // is normal Pump.fun launch activity, not a bundler signal.
       const timestamps = activeTransfers.map((tx) => tx.timestamp ?? 0).sort((a, b) => a - b);
       let burstCount = 0;
       for (let i = 1; i < timestamps.length; i++) {
         if (timestamps[i] - timestamps[i - 1] < 5) burstCount++;
       }
-      if (burstCount >= 15 && activePayers.size <= 3) {
+      if (burstCount >= bd.rule2MinBurstCount && activePayers.size <= bd.rule2MaxPayers) {
         reasons.push(`${burstCount} transfers within 5 seconds from ${activePayers.size} payers`);
+        isBundler = true;
+      }
+
+      // Rule 3: extreme burst — catches sustained high-frequency activity
+      // (e.g. 47 tx/sec) regardless of payer count.
+      if (burstCount >= bd.rule3MinBurstCount) {
+        reasons.push(`Extreme burst: ${burstCount} transfers within 5 seconds`);
         isBundler = true;
       }
 

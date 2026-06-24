@@ -7,13 +7,14 @@ export interface TokenInfo {
   decimals: number;
   marketCap: number;       // USD
   price: number;           // USD
+  priceChange1m: number;   // %
   priceChange5m: number;   // %
   priceChange1h: number;   // %
   volume1h: number;        // USD
   volume24h: number;       // USD
   liquidity: number;       // USD
   holderCount: number;
-  top10HolderPercent: number; // % held by top 10 wallets
+  top10HolderPercent: number; // 0-100 percentage held by top 10 wallets
   createdAt: number;       // unix timestamp
   mintAuthRevoked: boolean;
   freezeAuthRevoked: boolean;
@@ -52,7 +53,7 @@ export interface TokenInfo {
 export interface GmgnSnapshot {
   holders: number;
   liquidity: number;     // USD
-  top10: number;         // 0-1 fraction
+  top10: number;         // 0-100 percentage
   entrapment: number;    // 0-1 fraction
   creatorHold: number;   // 0-1 fraction
   freshWallet: number;   // 0-1 fraction
@@ -123,10 +124,19 @@ export interface Position {
   realisedPnlSol?: number;
   closeReason?: CloseReason;
   sellRetryCount?: number;
+  /** Consecutive transient sell failures (Jupiter/RPC blips). Unlike
+   *  sellRetryCount these never force-close the position — once they exceed
+   *  strategy.maxTransientSellRetries we alert the operator and keep retrying. */
+  transientRetryCount?: number;
+  /** True once the transient-retry operator alert has fired — de-dupes it. */
+  transientRetryAlerted?: boolean;
   /** GMGN metrics captured at entry, used by the runtime rug-signal detector. */
   gmgnSnapshot?: GmgnSnapshot;
   /** Last unix ms a bundler check ran for this position (throttling). */
   lastBundlerCheckAt?: number;
+  /** Price (SOL/token) at the most recent bundler check — used to detect
+   *  dump vs accumulation when a bundler burst fires. */
+  priceAtLastBundlerCheck?: number;
   /** Last unix ms a rug-signal check ran for this position (throttling). */
   lastRugCheckAt?: number;
   /** In-flight sell lock — guards against concurrent TP/SL sells racing on the
@@ -139,16 +149,39 @@ export interface Position {
   themeKey?: string;
   /** Consecutive force-probe failures (no swap route despite valid Price API). */
   routeProbeFailCount?: number;
+  /** Last price reading that passed the sanity check (not a spike). Used as
+   *  the baseline for rejecting anomalous readings from Jupiter swap-quotes. */
+  lastValidPrice?: number;
+  /** Count of consecutive price readings rejected by the spike detector. After
+ *  MAX_CONSECUTIVE_SPIKE_REJECTS rejections the latest reading is accepted
+ *  to prevent a position from sitting with a stale price forever. */
+  priceSpikeRejectCount?: number;
+  /** Priority fee paid for the buy transaction, in SOL. */
+  buyPriorityFeeSol?: number;
+  /** True if TP was detected but the partial sell ultimately failed after all retries. */
+  partialSellFailed?: boolean;
+  /** GMGN smart-money wallet count captured at entry, for post-entry flow
+   *  monitoring (alert if it later drops to 0). */
+  entrySmartDegenCount?: number;
+  /** Last unix ms a smart-money flow check ran for this position (throttling). */
+  lastSmartMoneyCheckAt?: number;
+  /** True once a 'smart money exiting' alert has fired — de-dupes the alert. */
+  smartMoneyExitAlerted?: boolean;
 }
 
 export type CloseReason =
   | 'take_profit'
   | 'stop_loss'
+  | 'hard_stop_loss'
   | 'manual'
   | 'timeout'
   | 'sell_stuck'
   | 'bundler_detected'
-  | 'rug_signal';
+  | 'rug_signal'
+  | 'price_feed_dark'
+  | 'liquidity_drop'
+  | 'dead_token_no_routes'
+  | 'trailing_stop';
 
 export interface TradeRecord {
   positionId: string;
@@ -160,6 +193,10 @@ export interface TradeRecord {
   txSig: string;
   timestamp: number;
   pnlSol?: number;
+  pnlPct?: number;
+  closeReason?: string;
+  /** Priority fee paid for this transaction, in SOL. */
+  priorityFee?: number;
 }
 
 // ─── Screening ────────────────────────────────────────────────────────────────
@@ -188,6 +225,15 @@ export interface SwapResult {
   tokensReceived?: number;
   solSpent?: number;
   error?: string;
+  /** SOL rent reclaimed by closing the empty SPL token account after a 100% sell. */
+  reclaimedSol?: number;
+  /**
+   * Classifies a failed swap so the caller can tell a real honeypot from a
+   * transient outage:
+   *  - 'permanent' — no route / simulation failed (token is unsellable)
+   *  - 'transient' — rate-limited (429) / timeout / network error (retry later)
+   */
+  failureType?: 'permanent' | 'transient';
 }
 
 export interface JupiterQuote {

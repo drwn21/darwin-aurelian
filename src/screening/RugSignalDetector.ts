@@ -45,7 +45,7 @@ export class RugSignalDetector {
       if (!cur) return { isRug: false, signals: [], rugScore: 0 };
 
       const curHolders = cur.holderCount || 0;
-      const curTop10 = cur.top10HolderPercent || 0;       // 0-1 fraction
+      const curTop10 = cur.top10HolderPercent || 0;       // 0-100 percentage
       const curLiq = cur.liquidity || 0;                  // USD
       const curEntrapment = cur.entrapmentRatio || 0;     // 0-1 fraction
       const curCreatorHold = cur.creatorHoldRate || 0;    // 0-1 fraction
@@ -66,7 +66,7 @@ export class RugSignalDetector {
         if (top10Spike > 50) {
           signals.push(
             `Top10 holders spiked ${top10Spike.toFixed(0)}% ` +
-              `(${(snapshot.top10 * 100).toFixed(1)}% → ${(curTop10 * 100).toFixed(1)}%)`,
+              `(${snapshot.top10.toFixed(1)}% → ${curTop10.toFixed(1)}%)`,
           );
           rugScore += 30;
         }

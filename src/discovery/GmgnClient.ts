@@ -241,6 +241,17 @@ export class GmgnClient {
     return Number.isFinite(n) ? n : 0;
   }
 
+  /**
+   * Like num(), but preserves null/undefined as undefined instead of coercing to
+   * 0. Used for fields (e.g. smart_degen_count) where 'missing from the API
+   * response' must be distinguishable from 'genuinely 0' downstream.
+   */
+  private numOrUndef(val: any): number | undefined {
+    if (val == null) return undefined;
+    const n = Number(val);
+    return Number.isFinite(n) ? n : undefined;
+  }
+
   private mapToTokenInfo(raw: any): TokenInfo {
     // Handle nested price object from /v1/token/info API
     const priceObj = typeof raw.price === 'object' ? raw.price : null;
@@ -263,10 +274,13 @@ export class GmgnClient {
       liquidity: this.num(raw.liquidity),
       volume1h: priceObj ? this.num(priceObj.volume_1h) : this.num(raw.volume_1h || raw.volume_1h_usd),
       volume24h: priceObj ? this.num(priceObj.volume_24h) : this.num(raw.volume || raw.volume_24h),
+      priceChange1m: priceObj ? this.num(priceObj.price_1m) : this.num(raw.price_change_percent_1m || raw.price_change_1m),
       priceChange5m: priceObj ? this.num(priceObj.price_5m) : this.num(raw.price_change_percent_5m || raw.price_change_5m),
       priceChange1h: priceObj ? this.num(priceObj.price_1h) : this.num(raw.price_change_percent_1h || raw.price_change_1h),
       holderCount: this.num(raw.holder_count || raw.holders),
-      createdAt: this.num(raw.open_timestamp || raw.creation_timestamp || raw.creation_time),
+      // Prefer creation_timestamp (actual on-chain creation) over open_timestamp
+      // (which can be when the token appeared on GMGN trending, NOT actual creation time)
+      createdAt: this.num(raw.creation_timestamp || raw.open_timestamp || raw.creation_time),
       mintAuthRevoked: raw.renounced_mint === 1,
       freezeAuthRevoked: raw.renounced_freeze_account === 1,
       lpBurned: this.num(raw.burn_ratio) > 0,
@@ -274,7 +288,7 @@ export class GmgnClient {
       isHoneypot: raw.is_honeypot === 1,
       isWashTrading: raw.is_wash_trading === true,
       devHoldingPercent: this.num(raw.dev_team_hold_rate) * 100,
-      top10HolderPercent: this.num(raw.top_10_holder_rate),
+      top10HolderPercent: this.num(raw.top_10_holder_rate) * 100, // GMGN returns 0-1 fraction, normalize to 0-100%
       bundlerRate: this.num(raw.bundler_rate),
       freshWalletRate: this.num(raw.fresh_wallet_rate),
       devTeamHoldRate: this.num(raw.dev_team_hold_rate),
@@ -283,7 +297,7 @@ export class GmgnClient {
       washTrading: Boolean(raw.wash_trading || raw.is_wash_trading),
       // Pre-pump / quality signals — default to 0 when the feed omits them.
       entrapmentRatio: this.num(raw.entrapment_ratio),
-      smartDegenCount: this.num(raw.smart_degen_count),
+      smartDegenCount: this.numOrUndef(raw.smart_degen_count),
       sniperCount: this.num(raw.sniper_count),
       hotLevel: this.num(raw.hot_level),
       creatorHoldRate: this.num(raw.creator_hold_rate || raw.creator_token_hold_rate),

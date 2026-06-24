@@ -53,16 +53,39 @@ export class TradeHistory {
     return wins.length / sells.length;
   }
 
+  getTotalPriorityFeeSol(): number {
+    return this.trades.reduce((sum, t) => sum + (t.priorityFee ?? 0), 0);
+  }
+
   getSummary(): string {
     const sells = this.trades.filter((t) => t.side === 'sell');
     const totalPnl = this.getTotalPnlSol();
     const dailyPnl = this.getDailyPnlSol();
     const winRate = (this.getWinRate() * 100).toFixed(1);
+    const wins = sells.filter((t) => (t.pnlSol ?? 0) > 0).length;
+    const losses = sells.length - wins;
+    const totalPriorityFee = this.getTotalPriorityFeeSol();
+    const todaySells = this.getTodaysTrades().filter((t) => t.side === 'sell');
+    const todayWins = todaySells.filter((t) => (t.pnlSol ?? 0) > 0).length;
+    const todayLosses = todaySells.length - todayWins;
+    const todayWinRate = todaySells.length > 0
+      ? ((todayWins / todaySells.length) * 100).toFixed(1)
+      : '0.0';
     return (
-      `Total trades: ${sells.length} | Win rate: ${winRate}%\n` +
-      `Total PnL: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL\n` +
-      `Today PnL: ${dailyPnl >= 0 ? '+' : ''}${dailyPnl.toFixed(4)} SOL`
+      `🕐 All-Time: ${sells.length} trades\n` +
+      `💰 Total: ${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL\n` +
+      `⛽ Fees: ${totalPriorityFee.toFixed(4)} SOL\n` +
+      `🎯 Win Rate: ${winRate}% (${wins}W/${losses}L)\n\n` +
+      `📅 Today: ${todaySells.length} trades\n` +
+      `💰 Today: ${dailyPnl >= 0 ? '+' : ''}${dailyPnl.toFixed(4)} SOL\n` +
+      `🎯 Win Rate: ${todayWinRate}% (${todayWins}W/${todayLosses}L)`
     );
+  }
+
+  getRecentSells(count: number): TradeRecord[] {
+    return this.trades
+      .filter((t) => t.side === 'sell')
+      .slice(-count);
   }
 
   private load(): void {

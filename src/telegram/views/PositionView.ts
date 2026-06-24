@@ -1,11 +1,21 @@
 import { Bot, Context, InlineKeyboard } from 'grammy';
 import { PositionManager } from '../../position/PositionManager.js';
 import { ExecutionEngine } from '../../execution/ExecutionEngine.js';
-import { Position } from '../../types/index.js';
+import { Position, TradeRecord } from '../../types/index.js';
 import { STRATEGY } from '../../config/config.js';
 import { configManager } from '../../config/ConfigManager.js';
 import { escapeMarkdown } from '../../utils/markdown.js';
 import { logger } from '../../logger/Logger.js';
+
+/** Format SOL price as full decimal (e.g. 0.000583 instead of 5.83e-4). */
+function formatSol(price: number): string {
+  if (price >= 0.01) return price.toFixed(6);
+  if (price === 0) return '0';
+  // Find how many decimal places needed to show 2 significant digits
+  const abs = Math.abs(price);
+  const decimals = Math.max(6, Math.ceil(-Math.log10(abs)) + 2);
+  return price.toFixed(decimals);
+}
 
 interface PositionViewState {
   messageId?: number;
@@ -101,12 +111,12 @@ export class PositionView {
 
     // Peak price tracked on the position itself (highest since entry).
     const peakPrice = pos.peakPrice;
-    const peakStr = peakPrice < 0.01 ? peakPrice.toExponential(2) : peakPrice.toFixed(6);
+    const peakStr = formatSol(peakPrice);
     const peakPct = ((peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
     // Entry/Current format with inline MC (SOL-denominated)
-    const entryStr = pos.entryPrice < 0.01 ? pos.entryPrice.toExponential(2) : pos.entryPrice.toFixed(6);
-    const currentStr = pos.currentPrice < 0.01 ? pos.currentPrice.toExponential(2) : pos.currentPrice.toFixed(6);
+    const entryStr = formatSol(pos.entryPrice);
+    const currentStr = formatSol(pos.currentPrice);
     const solUsd = configManager.solPriceUsd;
 
     // MC in SOL for entry and current
@@ -144,7 +154,10 @@ export class PositionView {
 
     // Exit strategy: show trailing TP status
     text += `\n📈 *Exit Strategy*\n`;
-    if (pos.firstTargetHit) {
+    if (pos.partialSellFailed) {
+      text += `⚠️ TP detected (sell failed \u2014 retrying)\n`;
+      text += `🏃 Runner: trailing \`${trailingStopPct}%\` from peak\n`;
+    } else if (pos.firstTargetHit) {
       text += `✅ TP hit (sold ${firstTargetSellPct}%)\n`;
       text += `🏃 Runner: trailing \`${trailingStopPct}%\` from peak\n`;
     } else {
@@ -318,6 +331,7 @@ export class PositionView {
 
     const pnlPct = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
     const solReceived = Math.abs(result.solSpent ?? 0);
+    const sellPf = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
 
     // Notify success. Token counts are RAW base units — scale to whole tokens.
     const dec = pos.decimals ?? 0;
@@ -330,14 +344,35 @@ export class PositionView {
 
     await ctx.reply(msg, { parse_mode: 'Markdown' });
 
-    // If all tokens sold, close position
+    // If all tokens sold, close position and reclaim token account
     if (pos.tokensReceived <= 0) {
+      const buyPf = pos.buyPriorityFeeSol ?? 0;
+      const reclaimedSol = result.reclaimedSol ?? 0;
+      const realisedPnlSol = solReceived + reclaimedSol - pos.entryAmountSol - buyPf - sellPf;
       pos.status = 'closed';
       pos.closedAt = Date.now();
       pos.exitTxSig = result.txSig;
       pos.exitAmountSol = solReceived;
-      pos.realisedPnlSol = solReceived - pos.entryAmountSol;
+      pos.realisedPnlSol = realisedPnlSol;
       pos.closeReason = 'manual';
+
+      // Record trade to history (matches PositionManager.performClose pattern)
+      const trade: TradeRecord = {
+        positionId: pos.id,
+        tokenAddress,
+        tokenSymbol: pos.tokenSymbol,
+        side: 'sell',
+        amountSol: solReceived,
+        price: pos.currentPrice,
+        txSig: result.txSig ?? '',
+        timestamp: Date.now(),
+        pnlSol: realisedPnlSol,
+        pnlPct: (realisedPnlSol / pos.entryAmountSol) * 100,
+        closeReason: 'manual',
+        priorityFee: sellPf,
+      };
+      this.positions.getHistory().record(trade);
+
       this.positions.getPosition(tokenAddress); // Trigger cleanup
       await ctx.reply(`🏁 Position ${pos.tokenSymbol} fully closed.`);
     } else {
@@ -410,6 +445,10 @@ export class PositionView {
         const result = await this.engine.sell(pos.tokenAddress, tokensToSell);
         if (result.success) {
           const solReceived = Math.abs(result.solSpent ?? 0);
+          const buyPf = pos.buyPriorityFeeSol ?? 0;
+          const sellPf = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
+          const reclaimedSol = result.reclaimedSol ?? 0;
+          const realisedPnlSol = solReceived + reclaimedSol - pos.entryAmountSol - buyPf - sellPf;
           const pnlPct = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
 
           // Update position
@@ -418,10 +457,27 @@ export class PositionView {
           pos.closedAt = Date.now();
           pos.exitTxSig = result.txSig;
           pos.exitAmountSol = solReceived;
-          pos.realisedPnlSol = solReceived - pos.entryAmountSol;
+          pos.realisedPnlSol = realisedPnlSol;
           pos.closeReason = 'manual';
 
-          results.push(`✅ ${sym}: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% (${solReceived.toFixed(4)} SOL)`);
+          // Record trade to history (matches PositionManager.performClose pattern)
+          const trade: TradeRecord = {
+            positionId: pos.id,
+            tokenAddress: pos.tokenAddress,
+            tokenSymbol: pos.tokenSymbol,
+            side: 'sell',
+            amountSol: solReceived,
+            price: pos.currentPrice,
+            txSig: result.txSig ?? '',
+            timestamp: Date.now(),
+            pnlSol: realisedPnlSol,
+            pnlPct: (realisedPnlSol / pos.entryAmountSol) * 100,
+            closeReason: 'manual',
+            priorityFee: sellPf,
+          };
+          this.positions.getHistory().record(trade);
+
+          results.push(`✅ ${sym}: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% (${solReceived.toFixed(6)} SOL)`);
           closed++;
         } else {
           results.push(`❌ ${sym}: ${escapeMarkdown(String(result.error))}`);

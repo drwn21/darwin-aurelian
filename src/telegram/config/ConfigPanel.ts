@@ -217,9 +217,11 @@ export class ConfigPanel {
       .text(tab('risk'), 'cfg:p:risk')
       .text(tab('strategy'), 'cfg:p:strategy')
       .row();
-    kb.text(tab('screen'), 'cfg:p:screen')
+    kb.text(tab('trailing'), 'cfg:p:trailing')
+      .text(tab('screen'), 'cfg:p:screen')
       .text(tab('gmgn'), 'cfg:p:gmgn')
-      .text(tab('safety'), 'cfg:p:safety')
+      .row();
+    kb.text(tab('safety'), 'cfg:p:safety')
       .row();
   }
 

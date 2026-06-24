@@ -1,11 +1,12 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { Position, CloseReason, TradeRecord } from '../types/index.js';
+import { Position, CloseReason, TradeRecord, GmgnSnapshot } from '../types/index.js';
 import { STRATEGY } from '../config/config.js';
 import { configManager } from '../config/ConfigManager.js';
-import { POSITION_CHECK_INTERVAL_MS, PRICE_UPDATE_INTERVAL_MS } from '../config/constants.js';
+import { POSITION_CHECK_INTERVAL_MS, PRICE_UPDATE_INTERVAL_MS, TRAILING_CHECK_INTERVAL_MS, MAX_PRICE_RATIO, MAX_CONSECUTIVE_SPIKE_REJECTS } from '../config/constants.js';
 import { JupiterClient } from '../execution/JupiterClient.js';
+import { GmgnClient } from '../discovery/GmgnClient.js';
 import { ExecutionEngine } from '../execution/ExecutionEngine.js';
 import { TradeHistory } from '../logger/TradeHistory.js';
 import { logger } from '../logger/Logger.js';
@@ -25,16 +26,41 @@ const PRICE_FAIL_GRACE_MS = 120_000; // 2 minutes
 
 type CloseHandler = (position: Position) => void;
 
+/**
+ * Tiered trailing stop: tighten trail % as unrealized profit grows.
+ * Locks in more gains on big runners while giving fresh positions room to breathe.
+ * All thresholds are configurable via the Telegram "Trailing" panel.
+ */
+function computeTieredTrailDrop(
+  unrealisedPnlPct: number,
+  baseTrail: number,
+  cfg?: { tieredTrailingEnabled?: boolean; tieredTrailAt100Pct?: number; tieredTrailAt200Pct?: number; tieredTrailAt500Pct?: number; tieredTrailAt1000Pct?: number },
+): number {
+  if (!cfg?.tieredTrailingEnabled) return baseTrail;
+  const t100 = cfg.tieredTrailAt100Pct ?? 16;
+  const t200 = cfg.tieredTrailAt200Pct ?? 13;
+  const t500 = cfg.tieredTrailAt500Pct ?? 10;
+  const t1000 = cfg.tieredTrailAt1000Pct ?? 8;
+  if (unrealisedPnlPct >= 1000) return Math.min(baseTrail, t1000);
+  if (unrealisedPnlPct >= 500)  return Math.min(baseTrail, t500);
+  if (unrealisedPnlPct >= 200)  return Math.min(baseTrail, t200);
+  if (unrealisedPnlPct >= 100)  return Math.min(baseTrail, t100);
+  return baseTrail;
+}
+
 export class PositionManager {
   private positions = new Map<string, Position>();
   private jupiter: JupiterClient;
+  private gmgn: GmgnClient;
   private engine: ExecutionEngine;
   private history: TradeHistory;
   private rugDetector: RugSignalDetector;
   private onClose?: CloseHandler;
+  private onPartialClose?: (pnlSol: number) => void;
   private onAlert?: (msg: string) => void;
   private priceTimer: NodeJS.Timeout | null = null;
   private checkTimer: NodeJS.Timeout | null = null;
+  private trailingTimer: NodeJS.Timeout | null = null;
   private liquidityTimer: NodeJS.Timeout | null = null;
   private forceProbeTick = 0;
 
@@ -43,14 +69,28 @@ export class PositionManager {
     history?: TradeHistory,
   ) {
     this.jupiter = new JupiterClient();
+    this.gmgn = new GmgnClient();
     this.engine = engine ?? new ExecutionEngine();
     this.history = history ?? new TradeHistory();
     this.rugDetector = new RugSignalDetector();
     this.loadPositions();
   }
 
+  getHistory(): TradeHistory {
+    return this.history;
+  }
+
   onPositionClosed(handler: CloseHandler): void {
     this.onClose = handler;
+  }
+
+  /**
+   * Register a handler invoked after a partial sell that leaves the position
+   * open (e.g. the TP partial). Lets the risk manager record the realized PnL of
+   * the sold slice — the full-close path only reports the remaining slice.
+   */
+  onPartialSell(handler: (pnlSol: number) => void): void {
+    this.onPartialClose = handler;
   }
 
   onAlertHandler(handler: (msg: string) => void): void {
@@ -92,6 +132,8 @@ export class PositionManager {
   start(): void {
     this.priceTimer = setInterval(() => void this.updatePrices(), PRICE_UPDATE_INTERVAL_MS);
     this.checkTimer = setInterval(() => void this.checkTPSL(), POSITION_CHECK_INTERVAL_MS);
+    // Fast-path trailing: 2s interval for positions with firstTargetHit=true
+    this.trailingTimer = setInterval(() => void this.trailingTick(), TRAILING_CHECK_INTERVAL_MS);
     // Liquidity monitoring: check every 60s (less frequent than price updates)
     this.liquidityTimer = setInterval(() => void this.checkLiquidity(), 60_000);
     logger.info('PositionManager started');
@@ -100,6 +142,7 @@ export class PositionManager {
   stop(): void {
     if (this.priceTimer) clearInterval(this.priceTimer);
     if (this.checkTimer) clearInterval(this.checkTimer);
+    if (this.trailingTimer) clearInterval(this.trailingTimer);
     if (this.liquidityTimer) clearInterval(this.liquidityTimer);
     logger.info('PositionManager stopped');
   }
@@ -115,7 +158,10 @@ export class PositionManager {
     marketCapUsd?: number,
     entryLiquidityUsd?: number,
     themeKey?: string,
+    entrySmartDegenCount?: number,
+    gmgnSnapshot?: GmgnSnapshot,
   ): Promise<Position> {
+    const buyPriorityFeeSol = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
     const pos: Position = {
       id: randomUUID(),
       tokenAddress,
@@ -134,9 +180,13 @@ export class PositionManager {
       openedAt: Date.now(),
       status: 'open',
       sellRetryCount: 0,
+      transientRetryCount: 0,
       takeProfitPct: configManager.get().strategy.takeProfitPct ?? STRATEGY.takeProfitPct,
       stopLossPct: configManager.get().strategy.stopLossPct ?? STRATEGY.stopLossPct,
       themeKey,
+      buyPriorityFeeSol,
+      entrySmartDegenCount,
+      gmgnSnapshot,
     };
     this.positions.set(tokenAddress, pos);
     this.savePositions();
@@ -150,6 +200,7 @@ export class PositionManager {
       price: entryPrice,
       txSig,
       timestamp: pos.openedAt,
+      priorityFee: buyPriorityFeeSol,
     };
     this.history.record(trade);
 
@@ -157,6 +208,7 @@ export class PositionManager {
       symbol: tokenSymbol,
       entryPrice,
       solIn: entryAmountSol,
+      buyPriorityFeeSol,
     });
     return pos;
   }
@@ -164,6 +216,9 @@ export class PositionManager {
   async closePosition(tokenAddress: string, reason: CloseReason): Promise<void> {
     const pos = this.positions.get(tokenAddress);
     if (!pos || pos.status !== 'open') return;
+
+    // Capture sell priority fee cost for PnL calculation
+    const sellPriorityFeeSol = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
     // H3: serialize sells per position — a second TP/SL check (or a manual
     // trigger) must not fire a duplicate sell while one is already in flight.
     if (pos.selling) {
@@ -172,13 +227,13 @@ export class PositionManager {
     }
     pos.selling = true;
     try {
-      await this.performClose(pos, tokenAddress, reason);
+      await this.performClose(pos, tokenAddress, reason, sellPriorityFeeSol);
     } finally {
       pos.selling = false;
     }
   }
 
-  private async performClose(pos: Position, tokenAddress: string, reason: CloseReason): Promise<void> {
+  private async performClose(pos: Position, tokenAddress: string, reason: CloseReason, sellPriorityFeeSol: number): Promise<void> {
     pos.status = 'pending_sell';
 
     const result = await this.engine.sell(tokenAddress, pos.tokensReceived);
@@ -200,7 +255,9 @@ export class PositionManager {
         if (retry.success) {
           // Treat retry success as a normal close
           const solReceived = Math.abs(retry.solSpent ?? 0);
-          const pnlSol = solReceived - pos.entryAmountSol;
+          const buyPf = pos.buyPriorityFeeSol ?? 0;
+          const reclaimedSol = retry.reclaimedSol ?? 0;
+          const pnlSol = solReceived + reclaimedSol - pos.entryAmountSol - buyPf - sellPriorityFeeSol;
           const pnlPct = (pnlSol / pos.entryAmountSol) * 100;
 
           pos.status = 'closed';
@@ -221,6 +278,9 @@ export class PositionManager {
             txSig: retry.txSig ?? '',
             timestamp: Date.now(),
             pnlSol,
+            pnlPct,
+            closeReason: reason,
+            priorityFee: sellPriorityFeeSol,
           };
           this.history.record(trade);
 
@@ -256,33 +316,101 @@ export class PositionManager {
         return;
       }
 
-      // Normal failure path — increment retry counter
+      // H1: distinguish a real honeypot (permanent — no route / sim failed) from
+      // a transient Jupiter/RPC blip (429 / timeout / network). Only permanent
+      // failures count toward the retry limit that records a -100% honeypot loss.
+      // Transient failures just retry next cycle so a flaky API can't mark a
+      // sellable position as unsellable.
+      const failureType = result.failureType ?? 'permanent';
+      if (failureType === 'transient') {
+        // Transient failures never force-close (a flaky API mustn't mark a
+        // sellable position unsellable), but they shouldn't retry silently
+        // forever either. Count them and alert the operator once the count
+        // crosses the configured limit — without auto-selling or marking as a
+        // honeypot. The position stays open and keeps retrying.
+        pos.transientRetryCount = (pos.transientRetryCount ?? 0) + 1;
+        const maxTransientSellRetries = configManager.get().strategy.maxTransientSellRetries;
+        logger.warn('Sell failed (transient) — retrying next cycle, not counting toward honeypot limit', {
+          token: tokenAddress,
+          symbol: pos.tokenSymbol,
+          reason,
+          transientRetries: pos.transientRetryCount,
+          error: result.error,
+        });
+        if (pos.transientRetryCount >= maxTransientSellRetries && !pos.transientRetryAlerted) {
+          pos.transientRetryAlerted = true;
+          logger.error('Transient sell retry limit reached — alerting operator (still retrying)', {
+            token: tokenAddress,
+            symbol: pos.tokenSymbol,
+            transientRetries: pos.transientRetryCount,
+          });
+          this.onAlert?.(
+            `⚠️ Position ${pos.tokenSymbol} has failed to sell ${pos.transientRetryCount} times ` +
+            `(transient errors). Manual intervention may be needed.`,
+          );
+        }
+        pos.status = 'open'; // revert so we retry next cycle
+        this.savePositions();
+        return;
+      }
+
+      // Permanent failure path — increment retry counter
       pos.sellRetryCount = (pos.sellRetryCount ?? 0) + 1;
 
       const maxSellRetries = configManager.get().strategy.maxSellRetries;
       if (pos.sellRetryCount >= maxSellRetries) {
-        logger.error('Sell retry limit reached — marking position as stuck', {
+        logger.error('Sell retry limit reached — recording -100% loss and closing', {
           token: tokenAddress,
           symbol: pos.tokenSymbol,
           reason,
           retries: pos.sellRetryCount,
           error: result.error,
         });
-        pos.status = 'stuck';
+
+        // Record -100% PnL — token is unsellable (honeypot / dead LP)
+        const buyPf = pos.buyPriorityFeeSol ?? 0;
+        const pnlSol = -pos.entryAmountSol - buyPf;
+        const pnlPct = -100;
+
+        pos.status = 'closed';
+        pos.closedAt = Date.now();
+        pos.exitAmountSol = 0;
+        pos.realisedPnlSol = pnlSol;
         pos.closeReason = 'sell_stuck';
-        this.savePositions();
-        logger.warn(`Failed to sell ${pos.tokenSymbol} after ${maxSellRetries} retries — manual close needed`, {
-          token: tokenAddress,
+        pos.tokensReceived = 0;
+
+        const trade: TradeRecord = {
+          positionId: pos.id,
+          tokenAddress,
+          tokenSymbol: pos.tokenSymbol,
+          side: 'sell',
+          amountSol: 0,
+          price: 0,
+          txSig: '',
+          timestamp: Date.now(),
+          pnlSol,
+          pnlPct,
+          closeReason: 'sell_stuck',
+        };
+        this.history.record(trade);
+
+        logger.info('Position closed as honeypot loss', {
           symbol: pos.tokenSymbol,
-          entryAmountSol: pos.entryAmountSol,
-          tokensReceived: pos.tokensReceived,
+          pnlSol: pnlSol.toFixed(4),
+          pnlPct: '-100%',
         });
+
+        this.positions.delete(tokenAddress);
+        this.savePositions();
+        this.onClose?.(pos);
         return;
       }
 
       const posAgeMs = Date.now() - pos.openedAt;
       const canSellBackMinAgeMs = configManager.get().strategy.canSellBackMinAgeMs;
-      if (posAgeMs < canSellBackMinAgeMs) {
+      const isEmergency = reason === 'stop_loss' || reason === 'hard_stop_loss' ||
+        reason === 'price_feed_dark' || reason === 'liquidity_drop' || reason === 'rug_signal';
+      if (posAgeMs < canSellBackMinAgeMs && !isEmergency) {
         logger.warn('Sell failed on young position — will retry next cycle', {
           token: tokenAddress,
           symbol: pos.tokenSymbol,
@@ -300,7 +428,9 @@ export class PositionManager {
     }
 
     const solReceived = Math.abs(result.solSpent ?? 0);
-    const pnlSol = solReceived - pos.entryAmountSol;
+    const buyPf = pos.buyPriorityFeeSol ?? 0;
+    const reclaimedSol = result.reclaimedSol ?? 0;
+    const pnlSol = solReceived + reclaimedSol - pos.entryAmountSol - buyPf - sellPriorityFeeSol;
     const pnlPct = (pnlSol / pos.entryAmountSol) * 100;
 
     pos.status = 'closed';
@@ -320,15 +450,22 @@ export class PositionManager {
       txSig: result.txSig ?? '',
       timestamp: Date.now(),
       pnlSol,
+      pnlPct,
+      closeReason: reason,
+      priorityFee: sellPriorityFeeSol,
     };
     this.history.record(trade);
 
-    logger.info('Position closed', {
+    const logFields: Record<string, unknown> = {
       symbol: pos.tokenSymbol,
       reason,
       pnlSol: pnlSol.toFixed(4),
       pnlPct: pnlPct.toFixed(1) + '%',
-    });
+    };
+    if (reclaimedSol > 0) {
+      logFields.reclaimedSol = reclaimedSol.toFixed(4);
+    }
+    logger.info('Position closed', logFields);
 
     this.positions.delete(tokenAddress);
     this.savePositions();
@@ -427,11 +564,47 @@ export class PositionManager {
       }
 
       if (price !== undefined && price > 0) {
+        // ── Price spike guard ───────────────────────────────────────────
+        // Jupiter swap-quote can return bogus prices for low-liquidity
+        // tokens (known issue).  A single outlier reading (e.g. 2000×
+        // spike) sets a fake peakPrice, triggers TP at an impossible PnL,
+        // then triggers trailing stop on the next real reading.  Compare
+        // new price against the last validated reading and reject if the
+        // ratio exceeds MAX_PRICE_RATIO (default 10×).
+        const baseline = pos.lastValidPrice ?? pos.currentPrice;
+        if (baseline > 0) {
+          const ratio = price / baseline;
+          const isSpike = ratio > MAX_PRICE_RATIO || ratio < (1 / MAX_PRICE_RATIO);
+          if (isSpike) {
+            pos.priceSpikeRejectCount = (pos.priceSpikeRejectCount ?? 0) + 1;
+            if (pos.priceSpikeRejectCount < MAX_CONSECUTIVE_SPIKE_REJECTS) {
+              logger.warn('Price spike rejected', {
+                symbol: pos.tokenSymbol,
+                oldPrice: baseline,
+                newPrice: price,
+                ratio: ratio.toFixed(2),
+                consecutiveRejects: pos.priceSpikeRejectCount,
+              });
+              // Don't update currentPrice or peakPrice — keep last valid
+              pos.priceFailCount = 0; // it's not a miss, just a bad reading
+              continue; // skip to next position
+            }
+            logger.warn('Price spike accepted after N consecutive rejects — using latest reading', {
+              symbol: pos.tokenSymbol,
+              newPrice: price,
+              consecutiveRejects: pos.priceSpikeRejectCount,
+            });
+          }
+        }
+        // Price passed sanity check (or first reading, or forced after N rejects)
+        pos.priceSpikeRejectCount = 0;
+        pos.lastValidPrice = price;
         pos.currentPrice = price;
         pos.priceFailCount = 0;
         if (price > pos.peakPrice) pos.peakPrice = price;
         const unrealisedSol = (price - pos.entryPrice) / pos.entryPrice * pos.entryAmountSol;
         pos.unrealisedPnlSol = unrealisedSol;
+
       } else {
         // H4: couldn't price this token this tick (Price API + swap-quote both
         // missed). Count consecutive misses so checkTPSL can fail-closed (sell)
@@ -439,8 +612,55 @@ export class PositionManager {
         // likely dead/rugged.
         pos.priceFailCount = (pos.priceFailCount ?? 0) + 1;
       }
+
+      // Smart-money flow: re-fetch the GMGN smart-degen count and alert (no
+      // auto-sell) if wallets that were present at entry have fully exited.
+      await this.checkSmartMoneyFlow(pos);
     }
     this.savePositions();
+  }
+
+  /** Minimum gap between smart-money flow checks per position. */
+  private static readonly SMART_MONEY_CHECK_INTERVAL_MS = 60_000;
+
+  /**
+   * Post-entry smart-money monitoring. If smart-degen wallets were present at
+   * entry (≥1) and have since dropped to 0, log a warning and alert the
+   * operator. This is informational only — it does NOT auto-sell. Throttled
+   * per position and de-duped so it fires at most once.
+   */
+  private async checkSmartMoneyFlow(pos: Position): Promise<void> {
+    if (!pos.entrySmartDegenCount || pos.entrySmartDegenCount < 1) return;
+    if (pos.smartMoneyExitAlerted) return;
+
+    const now = Date.now();
+    if (pos.lastSmartMoneyCheckAt &&
+        now - pos.lastSmartMoneyCheckAt < PositionManager.SMART_MONEY_CHECK_INTERVAL_MS) {
+      return;
+    }
+    pos.lastSmartMoneyCheckAt = now;
+
+    const info = await this.gmgn.fetchTokenInfo(pos.tokenAddress);
+    if (!info) return;
+
+    // M3: distinguish 'field missing from API response' from 'present and 0'.
+    // A missing field must NOT be treated as 0 — that would fire a false exit
+    // alert. Skip this cycle when the field is absent and wait for a real value.
+    const current = info.smartDegenCount;
+    if (current === undefined || current === null) return;
+
+    if (current === 0) {
+      pos.smartMoneyExitAlerted = true;
+      logger.warn('Smart money exiting', {
+        symbol: pos.tokenSymbol,
+        token: pos.tokenAddress,
+        entrySmartDegenCount: pos.entrySmartDegenCount,
+        currentSmartDegenCount: current,
+      });
+      this.onAlert?.(
+        `⚠️ Smart money exiting ${pos.tokenSymbol} — was ${pos.entrySmartDegenCount}, now 0 (holding, no auto-sell)`,
+      );
+    }
   }
 
   private async checkTPSL(): Promise<void> {
@@ -508,22 +728,27 @@ export class PositionManager {
       // TP: partial sell + activate trailing
       if (!pos.firstTargetHit && pctChange >= tp) {
         logger.info('TP triggered (partial)', { symbol: pos.tokenSymbol, pct: pctChange.toFixed(1), sellPct });
-        await this.partialSell(pos, sellPct, 'take_profit');
-        pos.firstTargetHit = true;
+        const sellOk = await this.partialSell(pos, sellPct, 'take_profit');
+        if (sellOk) {
+          pos.firstTargetHit = true;
+        }
         continue;
       }
 
-      // Trailing TP: close if drops trailDrop% from peak
+      // Trailing TP: close if drops tiered trailDrop% from peak
       if (useTrail && pos.firstTargetHit) {
+        const pnlPct = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        const effectiveTrail = computeTieredTrailDrop(pnlPct, trailDrop, cfg.strategy);
         const dropFromPeak = ((pos.peakPrice - pos.currentPrice) / pos.peakPrice) * 100;
-        if (dropFromPeak >= trailDrop) {
+        if (dropFromPeak >= effectiveTrail) {
           logger.info('Trailing TP triggered', {
             symbol: pos.tokenSymbol,
             peak: pos.peakPrice,
             current: pos.currentPrice,
             drop: dropFromPeak.toFixed(1),
+            effectiveTrail,
           });
-          await this.closePosition(pos.tokenAddress, 'take_profit');
+          await this.closePosition(pos.tokenAddress, 'trailing_stop');
         }
       }
 
@@ -533,6 +758,71 @@ export class PositionManager {
         await this.closePosition(pos.tokenAddress, 'timeout');
       }
     }
+  }
+
+  /**
+   * Fast-path trailing check. Runs every TRAILING_CHECK_INTERVAL_MS (2s) for
+   * positions with firstTargetHit=true. Fetches a fresh price via swap-quote
+   * fallback (Pump.fun tokens aren't indexed by Price API) and checks the
+   * trailing stop immediately. This closes the timing gap that caused the
+   * EC43 overshoot (-19.2% → -29.4% in one 5s window).
+   */
+  private async trailingTick(): Promise<void> {
+    const cfg = configManager.get();
+    const useTrail = cfg.strategy.useTrailingStop ?? STRATEGY.useTrailingStop;
+    if (!useTrail) return;
+
+    const trailDrop = cfg.strategy.trailingStopPct ?? STRATEGY.trailingStopPct;
+    const trailing = this.getOpenPositions().filter(
+      p => p.firstTargetHit && !p.selling
+    );
+    if (trailing.length === 0) return;
+
+    for (const pos of trailing) {
+      // Fetch fresh price via swap-quote (Pump.fun tokens need this)
+      const price = await this.jupiter.quotePriceInSol(
+        pos.tokenAddress,
+        pos.decimals ?? 0
+      );
+      if (price === null || price <= 0) continue;
+
+      // Spike guard — same logic as updatePrices()
+      const baseline = pos.lastValidPrice ?? pos.currentPrice;
+      if (baseline > 0) {
+        const ratio = price / baseline;
+        if (ratio > MAX_PRICE_RATIO || ratio < (1 / MAX_PRICE_RATIO)) {
+          logger.debug('Trailing tick: spike rejected', {
+            symbol: pos.tokenSymbol,
+            old: baseline,
+            new: price,
+            ratio: ratio.toFixed(2),
+          });
+          continue;
+        }
+      }
+
+      // Update price and peak
+      pos.currentPrice = price;
+      pos.lastValidPrice = price;
+      if (price > pos.peakPrice) pos.peakPrice = price;
+
+      // Tiered trailing stop check
+      const pnlPct = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const effectiveTrail = computeTieredTrailDrop(pnlPct, trailDrop, cfg.strategy);
+      const dropFromPeak = ((pos.peakPrice - pos.currentPrice) / pos.peakPrice) * 100;
+      if (dropFromPeak >= effectiveTrail) {
+        logger.info('Trailing TP triggered (fast tick)', {
+          symbol: pos.tokenSymbol,
+          peak: pos.peakPrice,
+          current: pos.currentPrice,
+          drop: dropFromPeak.toFixed(1),
+          effectiveTrail,
+          interval: '2s',
+        });
+        await this.closePosition(pos.tokenAddress, 'trailing_stop');
+      }
+    }
+    this.savePositions();
   }
 
   /**
@@ -605,15 +895,55 @@ export class PositionManager {
       pos.lastBundlerCheckAt = now;
       const result = await checkBundlerPattern(pos.tokenAddress, pos.tokenSymbol);
       if (result.isBundler) {
-        saveBundlerDetection(pos.tokenAddress, pos.tokenSymbol, result, pos.unrealisedPnlSol ?? 0);
-        logger.warn('Bundler pattern detected on open position — auto-closing', {
-          symbol: pos.tokenSymbol,
-          token: pos.tokenAddress,
-          details: result.details,
-        });
-        await this.closePosition(pos.tokenAddress, 'bundler_detected');
-        if (pos.status !== 'open') return true;
+        const runtimeDumpOnly = safety?.bundler?.runtimeDumpOnly !== false;
+        const dumpThreshold = safety?.bundler?.dumpPriceDropPct ?? 5;
+        const prevPrice = pos.priceAtLastBundlerCheck;
+        const curPrice = pos.currentPrice;
+
+        let isDump = true; // default: treat as dump when runtimeDumpOnly is off
+
+        if (runtimeDumpOnly && prevPrice != null && prevPrice > 0 && curPrice > 0) {
+          const priceDropPct = ((prevPrice - curPrice) / prevPrice) * 100;
+          isDump = priceDropPct >= dumpThreshold;
+          if (!isDump) {
+            logger.info('Bundler burst detected — accumulation (price stable/rising, NOT closing)', {
+              symbol: pos.tokenSymbol,
+              token: pos.tokenAddress,
+              details: result.details,
+              prevPrice,
+              curPrice,
+              priceDropPct: priceDropPct.toFixed(2) + '%',
+              dumpThreshold: dumpThreshold + '%',
+            });
+            saveBundlerDetection(pos.tokenAddress, pos.tokenSymbol, result, pos.unrealisedPnlSol ?? 0);
+          }
+        } else if (runtimeDumpOnly && (prevPrice == null || prevPrice <= 0)) {
+          // No previous price baseline yet — treat first detection as unknown,
+          // don't force-close. The next check will have a baseline.
+          logger.info('Bundler burst detected — no price baseline yet, holding (first check)', {
+            symbol: pos.tokenSymbol,
+            token: pos.tokenAddress,
+            details: result.details,
+          });
+          saveBundlerDetection(pos.tokenAddress, pos.tokenSymbol, result, pos.unrealisedPnlSol ?? 0);
+          isDump = false;
+        }
+
+        if (isDump) {
+          saveBundlerDetection(pos.tokenAddress, pos.tokenSymbol, result, pos.unrealisedPnlSol ?? 0);
+          logger.warn('Bundler DUMP detected on open position — auto-closing', {
+            symbol: pos.tokenSymbol,
+            token: pos.tokenAddress,
+            details: result.details,
+            prevPrice,
+            curPrice,
+          });
+          await this.closePosition(pos.tokenAddress, 'bundler_detected');
+          if (pos.status !== 'open') return true;
+        }
       }
+      // Always record the current price for the next check's baseline.
+      pos.priceAtLastBundlerCheck = pos.currentPrice;
     }
 
     // ── Developing rug (metric divergence from entry snapshot) ──
@@ -647,26 +977,58 @@ export class PositionManager {
    * and records the partial sell in trade history; the position stays open so
    * the remaining tokens can ride the trailing stop.
    */
-  private async partialSell(pos: Position, sellPct: number, reason: CloseReason): Promise<void> {
+  private async partialSell(pos: Position, sellPct: number, reason: CloseReason): Promise<boolean> {
     // H3: don't start a partial sell while another sell is already in flight.
-    if (pos.selling) return;
+    if (pos.selling) return false;
     const tokensToSell = Math.floor(pos.tokensReceived * (sellPct / 100));
-    if (tokensToSell <= 0) return;
-    pos.selling = true;
-    try {
-      await this.performPartialSell(pos, tokensToSell, sellPct, reason);
-    } finally {
-      pos.selling = false;
+    if (tokensToSell <= 0) return false;
+
+    const MAX_RETRIES = 3;
+    const BASE_DELAY_MS = 2000;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      pos.selling = true;
+      try {
+        const ok = await this.performPartialSell(pos, tokensToSell, sellPct, reason);
+        if (ok) return true;
+      } finally {
+        pos.selling = false;
+      }
+
+      // If this was the last attempt, give up
+      if (attempt >= MAX_RETRIES) break;
+
+      const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+      logger.warn('Partial sell failed, retrying', {
+        symbol: pos.tokenSymbol,
+        attempt: attempt + 1,
+        maxRetries: MAX_RETRIES,
+        nextRetryMs: delay,
+      });
+      await new Promise<void>(resolve => setTimeout(resolve, delay));
     }
+
+    // All retries exhausted
+    pos.partialSellFailed = true;
+    const pctChange = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    this.onAlert?.(
+      `⚠️ TP detected for ${pos.tokenSymbol} at +${pctChange.toFixed(1)}% but partial sell failed after ${MAX_RETRIES} retries. Bot will continue monitoring with trailing stop.`
+    );
+    logger.error('Partial sell failed after all retries', {
+      symbol: pos.tokenSymbol,
+      retries: MAX_RETRIES,
+    });
+    return false;
   }
 
-  private async performPartialSell(pos: Position, tokensToSell: number, sellPct: number, reason: CloseReason): Promise<void> {
+  private async performPartialSell(pos: Position, tokensToSell: number, sellPct: number, reason: CloseReason): Promise<boolean> {
     const result = await this.engine.sell(pos.tokenAddress, tokensToSell);
     if (!result.success) {
       // Even if the sell "failed", the tx may have landed on-chain but
       // confirmation timed out. Sync from actual on-chain balance.
       const onChainBalance = await getTokenBalance(pos.tokenAddress);
-      if (onChainBalance < pos.tokensReceived) {
+      let tokensActuallySold = onChainBalance < pos.tokensReceived;
+      if (tokensActuallySold) {
         // Tokens were sold — update tracked amount to reflect reality
         logger.warn('Partial sell reported failure but balance decreased — syncing', {
           symbol: pos.tokenSymbol,
@@ -690,7 +1052,7 @@ export class PositionManager {
         logger.error('Partial sell failed', { symbol: pos.tokenSymbol, sellPct, reason, error: result.error });
       }
       this.savePositions();
-      return;
+      return tokensActuallySold;
     }
 
     const solReceived = Math.abs(result.solSpent ?? 0);
@@ -717,6 +1079,15 @@ export class PositionManager {
       pos.tokensReceived = 0;
       pos.closeReason = reason;
 
+      const buyPf = pos.buyPriorityFeeSol ?? 0;
+      const sellPf = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
+      const costBasis = pos.entryAmountSol * (sellPct / 100);
+      const buyPfPortion = buyPf * (sellPct / 100);
+      const partialPnlSol = solReceived - costBasis - buyPfPortion - sellPf;
+      const partialPnlPct = (partialPnlSol / costBasis) * 100;
+      // This partial sell exhausted the position — set realisedPnlSol so the
+      // close handler feeds the correct PnL to the risk manager.
+      pos.realisedPnlSol = partialPnlSol;
       const trade: TradeRecord = {
         positionId: pos.id,
         tokenAddress: pos.tokenAddress,
@@ -726,13 +1097,16 @@ export class PositionManager {
         price: pos.currentPrice,
         txSig: result.txSig ?? '',
         timestamp: Date.now(),
-        pnlSol: solReceived - (pos.entryAmountSol * (sellPct / 100)),
+        pnlSol: partialPnlSol,
+        pnlPct: partialPnlPct,
+        closeReason: reason,
+        priorityFee: sellPf,
       };
       this.history.record(trade);
       this.positions.delete(pos.tokenAddress);
       this.savePositions();
       this.onClose?.(pos);
-      return;
+      return true;
     }
 
     logger.info('Partial sell executed', {
@@ -744,6 +1118,12 @@ export class PositionManager {
       solReceived: solReceived.toFixed(4),
     });
 
+    const buyPf2 = pos.buyPriorityFeeSol ?? 0;
+    const sellPf2 = configManager.get().strategy.priorityFeeLamports / 1_000_000_000;
+    const costBasis2 = pos.entryAmountSol * (sellPct / 100);
+    const buyPfPortion2 = buyPf2 * (sellPct / 100);
+    const partialPnlSol2 = solReceived - costBasis2 - buyPfPortion2 - sellPf2;
+    const partialPnlPct2 = (partialPnlSol2 / costBasis2) * 100;
     const trade: TradeRecord = {
       positionId: pos.id,
       tokenAddress: pos.tokenAddress,
@@ -753,9 +1133,24 @@ export class PositionManager {
       price: pos.currentPrice,
       txSig: result.txSig ?? '',
       timestamp: Date.now(),
-      pnlSol: solReceived - (pos.entryAmountSol * (sellPct / 100)),
+      pnlSol: partialPnlSol2,
+      pnlPct: partialPnlPct2,
+      closeReason: reason,
+      priorityFee: sellPf2,
     };
     this.history.record(trade);
+
+    // H3: feed the realized PnL of the sold slice to the risk manager. The
+    // position stays open, so the full-close handler won't see this slice.
+    this.onPartialClose?.(partialPnlSol2);
+
+    // Reduce cost basis AFTER recording so remaining position's PnL is
+    // calculated correctly in performClose (trailing stop / SL).
+    // Also reduce the buy priority fee proportionally.
+    pos.entryAmountSol -= pos.entryAmountSol * (sellPct / 100);
+    pos.buyPriorityFeeSol = (pos.buyPriorityFeeSol ?? 0) * (1 - sellPct / 100);
+
     this.savePositions();
+    return true;
   }
 }

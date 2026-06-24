@@ -29,6 +29,26 @@ export interface TokenFilterOptions {
   minVolumeSpikeRatio?: number;
   /** Soft gate: composite score (0–100) a token must also clear to pass. */
   minCompositeScore?: number;
+  /** Minimum 24h volume in USD. */
+  minVolume24hUsd?: number;
+  /** Maximum bundler rate (0-1). Reject tokens with high bundler activity. */
+  maxBundlerRate?: number;
+  /** Maximum entrapment ratio (0-1). Reject tokens with high entrapment. */
+  maxEntrapmentRatio?: number;
+  /** Minimum 5m price change (%). Reject tokens dumping too hard. */
+  minPriceChange5mPct?: number;
+  /** Maximum 5m price change (%). Reject tokens pumping too hard. */
+  maxPriceChange5mPct?: number;
+  /** Maximum 1h price change (%). Reject tokens with extreme 1h pump. */
+  maxPriceChange1hPct?: number;
+  /** Minimum 1h price change (%). Reject tokens already dumping. */
+  minPriceChange1hPct?: number;
+  /** Minimum 1m price change (%). Reject tokens with sudden 1m dumps. */
+  minPriceChange1mPct?: number;
+  /** Maximum 1m price change (%). Reject tokens with suspicious 1m spikes. */
+  maxPriceChange1mPct?: number;
+  /** Minimum smart degen wallet count. Reject tokens with no smart money interest. */
+  minSmartDegenCount?: number;
 }
 
 type ResolvedOptions = Required<TokenFilterOptions>;
@@ -61,9 +81,48 @@ function clamp(value: number, min: number, max: number): number {
  */
 export class TokenFilter {
   private readonly overrides: TokenFilterOptions;
+  /** Track recent priceChange5m readings per token for deceleration detection. */
+  private readonly priceHistory = new Map<string, number[]>();
+  private static readonly MAX_HISTORY = 3;
 
   constructor(options: TokenFilterOptions = {}) {
     this.overrides = options;
+  }
+
+  /**
+   * Record a 5m price change reading for a token. Returns true if the token
+   * shows consistent deceleration (each reading lower than previous by >10%).
+   */
+  checkPriceDeceleration(address: string, priceChange5m: number): boolean {
+    const history = this.priceHistory.get(address) ?? [];
+    history.push(priceChange5m);
+    if (history.length > TokenFilter.MAX_HISTORY) {
+      history.shift(); // keep only last 3
+    }
+    this.priceHistory.set(address, history);
+
+    // Need at least 3 readings to detect a trend
+    if (history.length < 3) return false;
+
+    // Check for consistent deceleration: each reading lower than previous by >10%
+    for (let i = 1; i < history.length; i++) {
+      if (history[i] >= history[i - 1] - 10) return false;
+    }
+    return true;
+  }
+
+  /** Clear price history for a token (call when token is no longer a candidate). */
+  clearPriceHistory(address: string): void {
+    this.priceHistory.delete(address);
+  }
+
+  /** Prune history for tokens not seen recently. */
+  prunePriceHistory(activeAddresses: Set<string>): void {
+    for (const addr of this.priceHistory.keys()) {
+      if (!activeAddresses.has(addr)) {
+        this.priceHistory.delete(addr);
+      }
+    }
   }
 
   /**
@@ -95,6 +154,16 @@ export class TokenFilter {
       rejectDevHoldingPct: o.rejectDevHoldingPct ?? SCREENING.rejectDevHoldingPct,
       minVolumeSpikeRatio: o.minVolumeSpikeRatio ?? SCREENING.minVolumeSpikeRatio,
       minCompositeScore: o.minCompositeScore ?? live.minCompositeScore ?? SCREENING.minCompositeScore,
+      minVolume24hUsd: o.minVolume24hUsd ?? live.minVolume24hUsd ?? 0,
+      maxBundlerRate: o.maxBundlerRate ?? live.maxBundlerRate ?? 1,
+      maxEntrapmentRatio: o.maxEntrapmentRatio ?? live.maxEntrapmentRatio ?? 1,
+      minPriceChange5mPct: o.minPriceChange5mPct ?? live.minPriceChange5mPct ?? -100,
+      maxPriceChange5mPct: o.maxPriceChange5mPct ?? live.maxPriceChange5mPct ?? 999,
+      maxPriceChange1hPct: o.maxPriceChange1hPct ?? live.maxPriceChange1hPct ?? 999,
+      minPriceChange1hPct: o.minPriceChange1hPct ?? live.minPriceChange1hPct ?? -999,
+      minPriceChange1mPct: o.minPriceChange1mPct ?? live.minPriceChange1mPct ?? -100,
+      maxPriceChange1mPct: o.maxPriceChange1mPct ?? live.maxPriceChange1mPct ?? 999,
+      minSmartDegenCount: o.minSmartDegenCount ?? live.minSmartDegenCount ?? 0,
     };
   }
 
@@ -135,7 +204,7 @@ export class TokenFilter {
         score: result.score,
       });
     } else {
-      logger.debug('TokenFilter: REJECT', {
+      logger.info('TokenFilter: REJECT', {
         symbol: token.symbol,
         address: token.address,
         score: result.score,
@@ -217,6 +286,58 @@ export class TokenFilter {
       reasons.push(`dev holds ${token.devHoldingPercent.toFixed(1)}% > max ${o.rejectDevHoldingPct}%`);
     }
 
+    // ── Volume floor ────────────────────────────────────────────────────
+    if (o.minVolume24hUsd > 0 && token.volume24h < o.minVolume24hUsd) {
+      reasons.push(`24h vol $${fmt(token.volume24h)} < min $${fmt(o.minVolume24hUsd)}`);
+    }
+
+    // ── Bundler rate cap ────────────────────────────────────────────────
+    const bundlerRate = token.bundlerRate ?? 0;
+    if (o.maxBundlerRate < 1 && bundlerRate > o.maxBundlerRate) {
+      reasons.push(`bundler ${(bundlerRate * 100).toFixed(0)}% > max ${(o.maxBundlerRate * 100).toFixed(0)}%`);
+    }
+
+    // ── Entrapment cap ──────────────────────────────────────────────────
+    const entrapment = token.entrapmentRatio ?? 0;
+    if (o.maxEntrapmentRatio < 1 && entrapment > o.maxEntrapmentRatio) {
+      reasons.push(`entrapment ${(entrapment * 100).toFixed(0)}% > max ${(o.maxEntrapmentRatio * 100).toFixed(0)}%`);
+    }
+
+    // ── 5m price change range ───────────────────────────────────────────
+    if (o.minPriceChange5mPct > -100 && token.priceChange5m < o.minPriceChange5mPct) {
+      reasons.push(`5m change ${token.priceChange5m.toFixed(1)}% < min ${o.minPriceChange5mPct}%`);
+    }
+    if (o.maxPriceChange5mPct < 999 && token.priceChange5m > o.maxPriceChange5mPct) {
+      reasons.push(`5m change ${token.priceChange5m.toFixed(1)}% > max ${o.maxPriceChange5mPct}%`);
+    }
+
+    // ── 1h price change range ───────────────────────────────────────────
+    if (o.minPriceChange1hPct > -999 && token.priceChange1h < o.minPriceChange1hPct) {
+      reasons.push(`1h change ${token.priceChange1h.toFixed(1)}% < min ${o.minPriceChange1hPct}%`);
+    }
+    if (o.maxPriceChange1hPct < 999 && token.priceChange1h > o.maxPriceChange1hPct) {
+      reasons.push(`1h change ${token.priceChange1h.toFixed(1)}% > max ${o.maxPriceChange1hPct}%`);
+    }
+
+    // ── 1m price change range ──────────────────────────────────────────
+    if (o.minPriceChange1mPct > -100 && token.priceChange1m < o.minPriceChange1mPct) {
+      reasons.push(`1m change ${token.priceChange1m.toFixed(1)}% < min ${o.minPriceChange1mPct}%`);
+    }
+    if (o.maxPriceChange1mPct < 999 && token.priceChange1m > o.maxPriceChange1mPct) {
+      reasons.push(`1m change ${token.priceChange1m.toFixed(1)}% > max ${o.maxPriceChange1mPct}%`);
+    }
+
+    // ── Smart money gate ──────────────────────────────────────────────
+    const smartDegen = token.smartDegenCount ?? 0;
+    if (o.minSmartDegenCount > 0 && smartDegen < o.minSmartDegenCount) {
+      reasons.push(`smart degens ${smartDegen} < min ${o.minSmartDegenCount}`);
+    }
+
+    // ── Price deceleration check (5m trend) ────────────────────────────
+    if (this.checkPriceDeceleration(token.address, token.priceChange5m)) {
+      reasons.push(`5m price decelerating: ${token.priceChange5m.toFixed(1)}% (consistent downtrend)`);
+    }
+
     // ── Composite score (soft gate) ───────────────────────────────────────
     const breakdown = this.score(token);
     if (breakdown.total < o.minCompositeScore) {
@@ -227,17 +348,23 @@ export class TokenFilter {
   }
 
   /**
-   * Volume-spike ratio: recent 1h volume vs the 24h hourly average.
+   * Volume-spike ratio: 24h volume relative to market cap as an activity proxy.
    *
-   * Note: the GMGN feed does not expose a discrete 5m volume bucket, so this
-   * uses the finest-grained spike signal available (1h vs the trailing 24h
-   * baseline). A ratio of 1 means on-trend; >1 means the last hour is hotter
-   * than the day's average — the practical equivalent of a recent spike.
+   * M5: the previous implementation used priceChange5m as the proxy, which the
+   * momentum component already scores — double-counting recent price action.
+   * The volume/mcap ratio is an independent activity signal: >0.1 means the
+   * token is turning over a meaningful fraction of its cap (high activity),
+   * >0.5 is hot. Returns a ratio normalised around the same 0.5/1.0/1.5 bands
+   * the score() weighting expects.
    */
-  private volumeSpikeRatio(_token: TokenInfo): number {
-    // GMGN rank API doesn't expose volume_1h — return neutral ratio.
-    // Use priceChange1h as proxy for momentum instead.
-    return 1;
+  private volumeSpikeRatio(token: TokenInfo): number {
+    const mcap = token.marketCap ?? 0;
+    const vol = token.volume24h ?? 0;
+    if (!(mcap > 0) || !(vol > 0)) return 0.5; // unknown → neutral-low
+    const ratio = vol / mcap;
+    if (ratio > 0.5) return 1.5;
+    if (ratio > 0.1) return 1.0;
+    return 0.5;
   }
 
   /**
@@ -263,8 +390,10 @@ export class TokenFilter {
     // Distribution: less top-10 concentration is better (0% → 15, 100% → 0).
     const distribution = clamp((1 - token.top10HolderPercent / 100) * 15, 0, 15);
 
-    // Momentum: full marks at +30% over the last 5m; negative earns nothing.
-    const momentum = clamp((token.priceChange5m / 30) * 15, 0, 15);
+    // Momentum: full marks at +30% over the last 5m; negative penalizes score.
+    const momentum = token.priceChange5m >= 0
+      ? clamp((token.priceChange5m / 30) * 15, 0, 15)
+      : clamp((token.priceChange5m / 10) * 5, -5, 0);
 
     // Volume spike: full marks once the spike ratio reaches the threshold.
     const volumeSpikeRatio = this.volumeSpikeRatio(token);

@@ -53,7 +53,7 @@ export class TelegramBot {
       `${emoji} *Position Closed*\n` +
         `Token: ${escapeMarkdown(pos.tokenSymbol)}\n` +
         `Reason: ${escapeMarkdown(pos.closeReason ?? 'unknown')}\n` +
-        `PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL (${pnlPct.toFixed(1)}%)`,
+        `PnL: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(6)} SOL (${pnlPct.toFixed(1)}%)`,
     );
   }
 

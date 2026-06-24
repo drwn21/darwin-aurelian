@@ -202,25 +202,28 @@ export class TokenDiscovery extends EventEmitter {
           }
         } else {
           // Singleton: hold for singletonDelayMs to allow siblings to appear.
-          // Then apply STRICTER quality gates — without siblings for comparison,
-          // we can't rely on originality score alone. A lone token with bad
-          // distribution metrics is more likely a rug than a winner.
+          // Then apply quality gates — without siblings for comparison,
+          // we can't rely on originality score alone.
           const entry = entries[0];
           if (now - entry.seenAt >= singletonDelayMs) {
             if (!this.isRecentlySeen(entry.token.address, now)) {
               const t = entry.token;
-              const top10 = (t.top10HolderPercent ?? 0) * 100;
-              const fresh = (t.freshWalletRate ?? 0) * 100;
+              const top10 = (t.top10HolderPercent ?? 0);
               const entrap = (t.entrapmentRatio ?? 0) * 100;
               const holders = t.holderCount ?? 0;
 
-              const fails: string[] = [];
-              if (top10 > 50) fails.push(`top10 ${top10.toFixed(0)}% > 50%`);
-              if (fresh > 80) fails.push(`fresh ${fresh.toFixed(0)}% > 80%`);
-              if (holders < 80) fails.push(`holders ${holders} < 80`);
-              if (entrap > 10) fails.push(`entrap ${entrap.toFixed(0)}% > 10%`);
+              const sg = origCfg?.singleton;
+              const maxTop10 = sg?.maxTop10Pct ?? 65;
+              const minHolders = sg?.minHolders ?? 50;
+              const maxEntrap = sg?.maxEntrapmentPct ?? 40;
+              const maxFails = sg?.maxFails ?? 1;
 
-              if (fails.length > 0) {
+              const fails: string[] = [];
+              if (top10 > maxTop10) fails.push(`top10 ${top10.toFixed(0)}% > ${maxTop10}%`);
+              if (holders < minHolders) fails.push(`holders ${holders} < ${minHolders}`);
+              if (entrap > maxEntrap) fails.push(`entrap ${entrap.toFixed(0)}% > ${maxEntrap}%`);
+
+              if (fails.length > maxFails) {
                 logger.info('Singleton rejected — quality gate failed', {
                   symbol: t.symbol,
                   address: t.address,

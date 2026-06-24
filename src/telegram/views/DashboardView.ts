@@ -3,7 +3,7 @@ import { PositionManager } from '../../position/PositionManager.js';
 import { RiskManager } from '../../risk/RiskManager.js';
 import { TradeHistory } from '../../logger/TradeHistory.js';
 import { DryRunLogger } from '../../dryrun/DryRunLogger.js';
-import { STRATEGY, DRY_RUN, SCREENING } from '../../config/config.js';
+import { STRATEGY, SCREENING } from '../../config/config.js';
 import { BotMode } from '../../types/index.js';
 import { configManager } from '../../config/ConfigManager.js';
 import { ConfigPanel } from '../config/ConfigPanel.js';
@@ -85,7 +85,7 @@ export class DashboardView {
     const isProd = configManager.isProduction();
     const cfg = configManager.get();
 
-    const posCount = DRY_RUN ? dryRunSignals.length : positions.length;
+    const posCount = configManager.isDryRun() ? dryRunSignals.length : positions.length;
     const maxPos = cfg.main.maxConcurrentPositions ?? STRATEGY.maxConcurrentPositions;
     const tradeAmt = cfg.main.tradeAmountSol ?? STRATEGY.tradeAmountSol;
     const modeStr = mode === 'autonomous' ? '✅ ON' : '❌ OFF';
@@ -94,7 +94,7 @@ export class DashboardView {
     text += `*GMGN Sniper Bot* ${isProd ? '(PROD)' : '(TEST)'}\n\n`;
     text += `📊 Positions: ${posCount}/${maxPos}\n`;
     text += `🤖 Auto-Trade: ${modeStr}`;
-    if (DRY_RUN) text += ` (DRY RUN)`;
+    if (configManager.isDryRun()) text += ` (DRY RUN)`;
     text += `\n`;
     const tpPct = cfg.strategy.takeProfitPct ?? STRATEGY.takeProfitPct;
     const sellPct = cfg.strategy.firstTargetSellPct ?? STRATEGY.firstTargetSellPct;
@@ -104,7 +104,24 @@ export class DashboardView {
 
     text += `💰 Buy: ${tradeAmt} SOL | 🔴 SL: ${slPct}%\n`;
     text += `📈 TP: +${tpPct}% (sell ${sellPct}%, trail ${trailPct}%) | SL: ${slPct}% (hard ${hardSlPct}%)\n`;
-    text += `🎯 MC range: $${SCREENING.minMarketCapUsd / 1000}K-$${SCREENING.maxMarketCapUsd / 1000}K\n`;
+    const minMc = cfg.screening?.minMarketCapUsd ?? SCREENING.minMarketCapUsd;
+    const maxMc = cfg.screening?.maxMarketCapUsd ?? SCREENING.maxMarketCapUsd;
+    text += `🎯 MC: $${(minMc / 1000).toFixed(0)}K-$${(maxMc / 1000).toFixed(0)}K`;
+    const minVol = cfg.screening?.minVolume24hUsd;
+    if (minVol) text += ` | Vol: $${(minVol / 1000).toFixed(0)}K+`;
+    const maxBundler = cfg.screening?.maxBundlerRate;
+    if (maxBundler != null && maxBundler < 1) text += ` | Bundler: <${(maxBundler * 100).toFixed(0)}%`;
+    const maxEntrap = cfg.screening?.maxEntrapmentRatio;
+    if (maxEntrap != null && maxEntrap < 1) text += ` | Entrap: <${(maxEntrap * 100).toFixed(0)}%`;
+    text += `\n`;
+    const min5m = cfg.screening?.minPriceChange5mPct;
+    const max5m = cfg.screening?.maxPriceChange5mPct;
+    const max1h = cfg.screening?.maxPriceChange1hPct;
+    if (min5m != null || max5m != null || max1h != null) {
+      text += `📊 5m: ${min5m ?? '?'}%~${max5m ?? '?'}%`;
+      if (max1h != null) text += ` | 1h: <${max1h}%`;
+      text += `\n`;
+    }
     text += `\nSelect option:`;
 
     return text;
@@ -150,7 +167,7 @@ export class DashboardView {
       }
 
       case 'positions': {
-        if (DRY_RUN) {
+        if (configManager.isDryRun()) {
           await this.showDryRunPositions(ctx);
         } else {
           await this.showRealPositions(ctx);
@@ -160,27 +177,37 @@ export class DashboardView {
       }
 
       case 'pnl': {
+        const open = this.deps.positionManager.getOpenPositions();
+        const openPnl = open.reduce((sum, pos) => {
+          const pnl = (pos.currentPrice - pos.entryPrice) / pos.entryPrice * pos.entryAmountSol;
+          return sum + pnl;
+        }, 0);
+
         const summary = this.deps.tradeHistory.getSummary();
-        const sells = this.deps.tradeHistory.getTodaysTrades()
-          .filter((t) => t.side === 'sell')
-          .slice(-10);
+        const recent = this.deps.tradeHistory.getRecentSells(10);
+
         let detail = '';
-        if (sells.length > 0) {
-          detail = '\n\n*Trades:*\n';
-          for (const t of sells) {
+        if (recent.length > 0) {
+          detail = '\n📋 Recent (last 10):\n';
+          for (const t of recent.slice().reverse()) {
             const pnl = t.pnlSol ?? 0;
+            const pnlPct = t.pnlPct ?? 0;
             const emoji = pnl >= 0 ? '🟢' : '🔴';
             const sign = pnl >= 0 ? '+' : '';
-            const ago = Math.floor((Date.now() - t.timestamp) / 60000);
-            const agoStr = ago < 60 ? `${ago}m` : `${Math.floor(ago / 60)}h`;
-            detail += `${emoji} ${t.tokenSymbol} ${sign}${pnl.toFixed(4)} SOL (${agoStr} ago)\n`;
+            const reason = t.closeReason ? ` ${t.closeReason.replace(/_/g, ' ')}` : '';
+            detail += `${emoji} ${t.tokenSymbol}: ${sign}${pnl.toFixed(6)} SOL (${sign}${pnlPct.toFixed(1)}%)${reason}\n`;
           }
         }
-        const kb = new InlineKeyboard().text('« Back', 'dash:back');
-        await ctx.editMessageText(`*PnL Summary*\n\n${summary}${detail}`, {
-          parse_mode: 'Markdown',
-          reply_markup: kb,
-        }).catch(() => undefined);
+
+        const kb = new InlineKeyboard().text('🔄 Refresh', 'dash:pnl').row().text('« Back', 'dash:back');
+        const modeStr = configManager.isDryRun() ? 'DRY RUN' : 'LIVE';
+        await ctx.editMessageText(
+          `*🔴 PNL Summary — ${modeStr}*\n\n` +
+          `📈 Open: ${open.length} positions\n` +
+          `💰 Open PNL: ${openPnl >= 0 ? '+' : ''}${openPnl.toFixed(4)} SOL\n\n` +
+          summary + '\n' + detail,
+          { parse_mode: 'Markdown', reply_markup: kb },
+        ).catch(() => undefined);
         await ctx.answerCallbackQuery();
         break;
       }
@@ -262,9 +289,10 @@ export class DashboardView {
   /** Format a token price as a readable decimal (e.g. 0.000027), not exponential. */
   private formatPrice(price: number): string {
     if (price <= 0) return '0';
-    if (price >= 1) return price.toFixed(4);
-    if (price >= 0.0001) return price.toFixed(6);
-    return price.toPrecision(2); // very small memecoin prices: keep 2 significant digits
+    if (price >= 0.01) return price.toFixed(6);
+    const abs = Math.abs(price);
+    const decimals = Math.max(6, Math.ceil(-Math.log10(abs)) + 2);
+    return price.toFixed(decimals);
   }
 
   /** Show dry run signals as inline keyboard list */
@@ -323,11 +351,11 @@ export class DashboardView {
     const low = sig.lowestPrice ? ((sig.lowestPrice - sig.entryPrice) / sig.entryPrice * 100) : 0;
     const entryStr = this.formatPrice(sig.entryPrice);
     const entryUsd = sig.entryPrice > 0 && configManager.solPriceUsd > 0
-      ? `$${(sig.entryPrice * configManager.solPriceUsd).toExponential(1)}`
+      ? `$${this.formatPrice(sig.entryPrice * configManager.solPriceUsd)}`
       : '';
     const currentStr = sig.currentPrice ? this.formatPrice(sig.currentPrice) : '—';
     const currentUsd = sig.currentPrice && sig.currentPrice > 0 && configManager.solPriceUsd > 0
-      ? `$${(sig.currentPrice * configManager.solPriceUsd).toExponential(1)}`
+      ? `$${this.formatPrice(sig.currentPrice * configManager.solPriceUsd)}`
       : '';
     // MC at entry and now in SOL
     const entryMcSol = sig.entryPrice > 0 && configManager.solPriceUsd > 0 && sig.marketCap > 0
@@ -361,6 +389,7 @@ export class DashboardView {
 
   /** Show real positions (non-dry-run) */
   private async showRealPositions(ctx: Context): Promise<void> {
+    await this.deps.positionManager.updatePricesNow().catch(() => undefined);
     const open = this.deps.positionManager.getOpenPositions();
     if (open.length === 0) {
       const kb = new InlineKeyboard().text('« Back', 'dash:back');
@@ -378,6 +407,7 @@ export class DashboardView {
       kb.text(`${emoji} ${pos.tokenSymbol} ${sign}${pnlPct.toFixed(1)}%`, `pos:view:${pos.tokenAddress}`);
       kb.row();
     }
+    kb.text('🔄 Refresh', 'dash:positions').row();
     kb.text('« Back', 'dash:back');
 
     const text = `*📊 Open Positions (${open.length})*\n\nTap a position to view details:`;
